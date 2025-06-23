@@ -116,7 +116,7 @@ elif MENU == "日前价格预测":
     #
     # else:
     file = st.file_uploader("上传预测标的日负荷率数据 CSV/XLSX", type=["csv", "xlsx"])
-    x_col = st.text_input("负荷率列名称", "load_rate")
+    x_col = st.text_input("负荷率列名称", "日前负荷率(%)")
     if st.button("预测") and file:
         df = pd.read_csv(file) if file.name.endswith(".csv") else pd.read_excel(file)
         if x_col not in df.columns:
