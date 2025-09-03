@@ -4,6 +4,7 @@ import zipfile
 import streamlit as st
 import pandas as pd
 import numpy as np
+import altair as alt
 
 from model_utils import (
     list_models,
@@ -140,10 +141,10 @@ elif MENU == "模型训练":
 
 
 # ----------------------------------------
-# 3) 多模型日前价格预测
+# 3) 日前价格预测（容量→负荷率→价格，多模型叠加）
 # ----------------------------------------
 elif MENU == "日前价格预测":
-    st.subheader("根据负荷率预测日前价格（可多模型对比）")
+    st.subheader("多模型日前价格预测（容量→负荷率）")
 
     models = list_models()
     if not models:
@@ -154,35 +155,87 @@ elif MENU == "日前价格预测":
         st.warning("请至少选择一个模型")
         st.stop()
 
-    file = st.file_uploader("上传含负荷率列的 CSV/XLSX", type=["csv", "xlsx"])
-    x_col = st.text_input("负荷率列名称", "日前负荷率(%)")
+    capacity = st.number_input("日前在线机组容量 (MW)", min_value=0.0, value=1000.0, step=10.0)
+    file = st.file_uploader("上传包含‘竞价空间’列的 CSV/XLSX", type=["csv", "xlsx"])
     if st.button("预测") and file:
         df = pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
-        if x_col not in df.columns:
-            st.error(f"未找到列：'{x_col}'")
+        if capacity <= 0:
+            st.error("容量必须大于 0 MW")
             st.stop()
-        x_vals = df[x_col].values
+        # 自动识别竞价空间列
+        space_col = None
+        for cand in ["竞价空间(MW)", "竞价空间"]:
+            if cand in df.columns:
+                space_col = cand
+                break
+        if space_col is None:
+            fuzzy = [c for c in df.columns if ("竞价" in str(c)) and ("空间" in str(c))]
+            if fuzzy:
+                space_col = fuzzy[0]
+        if space_col is None:
+            st.error("未找到包含‘竞价空间’的列")
+            st.stop()
+
+        space_vals = pd.to_numeric(df[space_col], errors="coerce").values
+        if np.isnan(space_vals).all():
+            st.error("‘竞价空间’列无法解析为数值，请检查数据")
+            st.stop()
+
+        # 负荷率(%) = 竞价空间 / 日前在线机组容量(MW) * 100
+        load_rate = (space_vals / capacity) * 100.0
+
         preds_map = {}
         for name in selected_models:
             m = load_model(name)
             if m is None:
                 st.warning(f"模型 '{name}' 加载失败，已跳过")
                 continue
-            preds_map[name] = predict_price(m, x_vals)
+            preds_map[name] = predict_price(m, load_rate)
         if not preds_map:
             st.error("没有可用预测结果")
             st.stop()
-        time_slot = np.arange(1, len(x_vals) + 1)
-        wide_df = pd.DataFrame({"time_slot": time_slot})
+
+        # 生成 15 分钟粒度时间标签：00:15, 00:30, ...（若为 96 条则最后为 24:00）
+        _mins = np.arange(1, len(load_rate) + 1) * 15
+        _hrs = _mins // 60
+        _mm = _mins % 60
+        time_labels = [f"{int(h):02d}:{int(m):02d}" for h, m in zip(_hrs, _mm)]
+
+        # 表格显示：包括容量与负荷率
+        display_df = pd.DataFrame({
+            "time_slot": time_labels,
+            "日前在线机组容量 (MW)": np.full(len(time_labels), capacity, dtype=float),
+            "负荷率": load_rate,
+        })
         for name, arr in preds_map.items():
-            wide_df[name] = arr
-        st.dataframe(wide_df.head())
+            display_df[name] = arr
+        st.dataframe(display_df.head())
+
+        # 下载结果：包含 time_slot、容量、负荷率、各模型预测价格
+        download_df = display_df.copy()
         st.download_button(
             "下载预测结果（多模型）",
-            wide_df.to_csv(index=False).encode(),
+            download_df.to_csv(index=False).encode(),
             file_name="price_predictions.csv",
         )
-        st.line_chart(wide_df.set_index("time_slot"), height=300)
+
+        # 图表：仅显示各模型预测，不显示容量与负荷率；Y 轴锁定 0-1500，X 轴包含 24:00
+        model_cols = [c for c in download_df.columns if c not in ["time_slot", "日前在线机组容量 (MW)", "负荷率"]]
+        chart_df = download_df[["time_slot", *model_cols]].melt('time_slot', var_name='model', value_name='price')
+        hour_ticks = [t for t in time_labels if t.endswith(':00')]
+        if '24:00' in time_labels and '24:00' not in hour_ticks:
+            hour_ticks.append('24:00')
+        chart = (
+            alt.Chart(chart_df)
+            .mark_line()
+            .encode(
+                x=alt.X('time_slot:N', sort=None, scale=alt.Scale(domain=time_labels), axis=alt.Axis(values=hour_ticks, title='time_slot')),
+                y=alt.Y('price:Q', scale=alt.Scale(domain=[0, 1500]), title='price'),
+                color=alt.Color('model:N', title='model')
+            )
+            .properties(height=300)
+        )
+        st.altair_chart(chart, use_container_width=True)
 
 
 else:
