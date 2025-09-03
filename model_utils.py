@@ -3,8 +3,7 @@
 # ---------------------------------------------------------------------------
 
 from pathlib import Path
-from typing import Tuple, Optional
-import warnings
+from typing import Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
@@ -17,6 +16,8 @@ DATA_PATH = Path("data/marginal.csv")
 MODEL_PATH = Path("models/2025_marginal.pkl")
 DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
 MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+MODELS_DIR = Path("models")
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 # -------------------------------------------
 # Data cleaning (mirrors reappropriation.py)
@@ -66,51 +67,46 @@ def clean_marginal_data(df: pd.DataFrame, iqr_factor: float = 3.0) -> pd.DataFra
     df = df[(df['price'] >= lower) & (df['price'] <= upper)].reset_index(drop=True)
     return df
 
-# ---------------------------------------------------
-# Incremental retrain (core of reappropriation.py)
-# ---------------------------------------------------
+# ------------------------------------
+# Model training & management
+# ------------------------------------
 
-def incremental_retrain(
-    new_df: pd.DataFrame,
+def train_model(
+    df: pd.DataFrame,
+    model_name: str,
     *,
     n_segments: int = 3,
     iqr_factor: float = 3.0,
-) -> Tuple[pwlf.PiecewiseLinFit, np.ndarray, pd.DataFrame]:
-    """Merge new data, retrain pwlf, save both dataset & model."""
+) -> Tuple[pwlf.PiecewiseLinFit, np.ndarray]:
+    """Train pwlf model on provided DataFrame and save to models/{model_name}.pkl
 
-    # Clean *again* in case caller skipped
-    new_df = clean_marginal_data(new_df, iqr_factor=iqr_factor)
-
-    # Merge with existing
-    if DATA_PATH.exists():
-        base = pd.read_csv(DATA_PATH)
-        combined = pd.concat([base, new_df]).drop_duplicates(
-            subset=["date", "time_slot", "load_rate", "price"], keep="last"
-        )
-    else:
-        combined = new_df.copy()
-
-    # Persist merged dataset
-    combined.to_csv(DATA_PATH,index=False)
-
-    # Train pwlf model
-    x = combined["load_rate"].values
-    y = combined["price"].values
-
-    if len(x) < n_segments + 2:
-        warnings.warn(
-            "Sample size too small for requested segments; reducing segment count."
-        )
-        n_segments = max(1, len(x) - 2)
-
+    The input DataFrame is cleaned via clean_marginal_data.
+    Returns (model, breakpoints).
+    """
+    cleaned = clean_marginal_data(df.copy(), iqr_factor=iqr_factor)
+    x = cleaned["load_rate"].values
+    y = cleaned["price"].values
+    if len(x) < max(2, n_segments + 1):
+        raise ValueError("数据量过少，无法训练指定段数的模型")
     model = pwlf.PiecewiseLinFit(x, y)
     breakpoints = model.fit(n_segments)
-
-    # Save model
-    with open(MODEL_PATH, "wb") as f:
+    out_path = MODELS_DIR / f"{model_name}.pkl"
+    with open(out_path, "wb") as f:
         pickle.dump(model, f)
+    return model, breakpoints
 
-    return model, breakpoints, combined
+
+def list_models() -> List[str]:
+    """Return list of available model names (without .pkl suffix)."""
+    return sorted(p.stem for p in MODELS_DIR.glob("*.pkl"))
+
+
+def load_model(name: str) -> Optional[pwlf.PiecewiseLinFit]:
+    path = MODELS_DIR / f"{name}.pkl"
+    if not path.exists():
+        return None
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 # ------------------------------------
 # Helpers for forecast functionality
