@@ -3,8 +3,7 @@
 # ---------------------------------------------------------------------------
 
 from pathlib import Path
-from typing import Tuple, Optional
-import warnings
+from typing import Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
@@ -17,6 +16,8 @@ DATA_PATH = Path("data/marginal.csv")
 MODEL_PATH = Path("models/2025_marginal.pkl")
 DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
 MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+MODELS_DIR = Path("models")
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 # -------------------------------------------
 # Data cleaning (mirrors reappropriation.py)
@@ -66,51 +67,46 @@ def clean_marginal_data(df: pd.DataFrame, iqr_factor: float = 3.0) -> pd.DataFra
     df = df[(df['price'] >= lower) & (df['price'] <= upper)].reset_index(drop=True)
     return df
 
-# ---------------------------------------------------
-# Incremental retrain (core of reappropriation.py)
-# ---------------------------------------------------
+# ------------------------------------
+# Model training & management
+# ------------------------------------
 
-def incremental_retrain(
-    new_df: pd.DataFrame,
+def train_model(
+    df: pd.DataFrame,
+    model_name: str,
     *,
     n_segments: int = 3,
     iqr_factor: float = 3.0,
-) -> Tuple[pwlf.PiecewiseLinFit, np.ndarray, pd.DataFrame]:
-    """Merge new data, retrain pwlf, save both dataset & model."""
+) -> Tuple[pwlf.PiecewiseLinFit, np.ndarray]:
+    """Train pwlf model on provided DataFrame and save to models/{model_name}.pkl
 
-    # Clean *again* in case caller skipped
-    new_df = clean_marginal_data(new_df, iqr_factor=iqr_factor)
-
-    # Merge with existing
-    if DATA_PATH.exists():
-        base = pd.read_csv(DATA_PATH)
-        combined = pd.concat([base, new_df]).drop_duplicates(
-            subset=["date", "time_slot", "load_rate", "price"], keep="last"
-        )
-    else:
-        combined = new_df.copy()
-
-    # Persist merged dataset
-    combined.to_csv(DATA_PATH,index=False)
-
-    # Train pwlf model
-    x = combined["load_rate"].values
-    y = combined["price"].values
-
-    if len(x) < n_segments + 2:
-        warnings.warn(
-            "Sample size too small for requested segments; reducing segment count."
-        )
-        n_segments = max(1, len(x) - 2)
-
+    The input DataFrame is cleaned via clean_marginal_data.
+    Returns (model, breakpoints).
+    """
+    cleaned = clean_marginal_data(df.copy(), iqr_factor=iqr_factor)
+    x = cleaned["load_rate"].values
+    y = cleaned["price"].values
+    if len(x) < max(2, n_segments + 1):
+        raise ValueError("数据量过少，无法训练指定段数的模型")
     model = pwlf.PiecewiseLinFit(x, y)
     breakpoints = model.fit(n_segments)
-
-    # Save model
-    with open(MODEL_PATH, "wb") as f:
+    out_path = MODELS_DIR / f"{model_name}.pkl"
+    with open(out_path, "wb") as f:
         pickle.dump(model, f)
+    return model, breakpoints
 
-    return model, breakpoints, combined
+
+def list_models() -> List[str]:
+    """Return list of available model names (without .pkl suffix)."""
+    return sorted(p.stem for p in MODELS_DIR.glob("*.pkl"))
+
+
+def load_model(name: str) -> Optional[pwlf.PiecewiseLinFit]:
+    path = MODELS_DIR / f"{name}.pkl"
+    if not path.exists():
+        return None
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 # ------------------------------------
 # Helpers for forecast functionality
@@ -136,3 +132,90 @@ def load_or_train_model(n_segments: int = 3) -> Optional[pwlf.PiecewiseLinFit]:
 
 def predict_price(model: pwlf.PiecewiseLinFit, x: np.ndarray) -> np.ndarray:
     return model.predict(x)
+
+
+# -------------------------------------------------
+# Extended model management (artifacts + metadata)
+# -------------------------------------------------
+from typing import Dict, Any  # reuse typing, safe to re-import names
+from datetime import datetime
+import json
+
+def _paths(name: str) -> Dict[str, Path]:
+    base = MODELS_DIR
+    return {
+        "pkl": base / f"{name}.pkl",
+        "meta": base / f"{name}.meta.json",
+        "train": base / f"{name}.train.csv",
+    }
+
+
+def train_model_ex(
+    df: pd.DataFrame,
+    model_name: str,
+    *,
+    n_segments: int = 3,
+    iqr_factor: float = 1.5,
+    source: Optional[str] = None,
+) -> Tuple[pwlf.PiecewiseLinFit, np.ndarray]:
+    """Train + save model, metadata, and cleaned training data.
+
+    This does not modify legacy train_model; callers should use this function
+    to ensure artifacts exist for management UI.
+    """
+    cleaned = clean_marginal_data(df.copy(), iqr_factor=iqr_factor)
+    x = cleaned["load_rate"].values
+    y = cleaned["price"].values
+    if len(x) < max(2, n_segments + 1):
+        raise ValueError("数据量过少，无法训练指定段数的模型")
+    model = pwlf.PiecewiseLinFit(x, y)
+    breakpoints = model.fit(n_segments)
+
+    p = _paths(model_name)
+    with open(p["pkl"], "wb") as f:
+        pickle.dump(model, f)
+    cleaned.to_csv(p["train"], index=False)
+    meta: Dict[str, Any] = {
+        "name": model_name,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "n_segments": n_segments,
+        "iqr_factor": iqr_factor,
+        "rows": int(len(cleaned)),
+        "source": source or "unknown",
+        "breakpoints": [float(v) for v in np.asarray(breakpoints).tolist()],
+    }
+    with open(p["meta"], "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    return model, breakpoints
+
+
+def load_model_meta(name: str) -> Optional[Dict[str, Any]]:
+    p = _paths(name)["meta"]
+    if not p.exists():
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def delete_models(names: List[str]) -> Dict[str, List[str]]:
+    removed: List[str] = []
+    missing: List[str] = []
+    for n in names:
+        paths = _paths(n)
+        any_removed = False
+        for fp in paths.values():
+            if fp.exists():
+                try:
+                    fp.unlink()
+                    any_removed = True
+                except Exception:
+                    pass
+        if any_removed:
+            removed.append(n)
+        else:
+            missing.append(n)
+    return {"removed": removed, "missing": missing}
