@@ -39,9 +39,12 @@ if MENU == "模型管理":
                     st.warning("请先选择至少一个模型")
                 else:
                     summary = delete_models(selected)
-                    st.success(f"已删除: {', '.join(summary.get('removed', []))}")
-                    if summary.get('missing'):
-                        st.info(f"未找到: {', '.join(summary['missing'])}")
+                    removed = summary.get('removed', [])
+                    missing = summary.get('missing', [])
+                    if removed:
+                        st.success(f"已删除: {', '.join(removed)}")
+                    if missing:
+                        st.info(f"未找到: {', '.join(missing)}")
         with col_b:
             if st.button("打包下载所选模型"):
                 if not selected:
@@ -138,19 +141,18 @@ elif MENU == "模型训练":
 
 
 # ----------------------------------------
-# 3) 日前价格预测
+# 3) 日前价格预测（多模型叠加）
 # ----------------------------------------
 elif MENU == "日前价格预测":
-    st.subheader("根据负荷率预测日前价格")
+    st.subheader("根据负荷率预测日前价格（可多模型对比）")
 
     models = list_models()
     if not models:
         st.warning("暂无可用模型，请先在‘模型训练’页训练并保存模型。")
         st.stop()
-    chosen = st.selectbox("选择模型", models)
-    model = load_model(chosen)
-    if model is None:
-        st.error("模型加载失败")
+    selected_models = st.multiselect("选择模型", models, default=models[:1])
+    if not selected_models:
+        st.warning("请至少选择一个模型")
         st.stop()
 
     file = st.file_uploader("上传含负荷率列的 CSV/XLSX", type=["csv", "xlsx"])
@@ -160,20 +162,28 @@ elif MENU == "日前价格预测":
         if x_col not in df.columns:
             st.error(f"未找到列：'{x_col}'")
             st.stop()
-        preds = predict_price(model, df[x_col].values)
-        out_df = df.copy()
-        out_df["predicted_price"] = preds
-        st.dataframe(out_df.head())
+        x_vals = df[x_col].values
+        preds_map = {}
+        for name in selected_models:
+            m = load_model(name)
+            if m is None:
+                st.warning(f"模型 '{name}' 加载失败，已跳过")
+                continue
+            preds_map[name] = predict_price(m, x_vals)
+        if not preds_map:
+            st.error("没有可用预测结果")
+            st.stop()
+        time_slot = np.arange(1, len(x_vals) + 1)
+        wide_df = pd.DataFrame({"time_slot": time_slot})
+        for name, arr in preds_map.items():
+            wide_df[name] = arr
+        st.dataframe(wide_df.head())
         st.download_button(
-            "下载预测结果",
-            out_df.to_csv(index=False).encode(),
+            "下载预测结果（多模型）",
+            wide_df.to_csv(index=False).encode(),
             file_name="price_predictions.csv",
         )
-        chart_df = pd.DataFrame({
-            "time_slot": np.arange(1, len(preds) + 1),
-            "price": preds,
-        })
-        st.line_chart(chart_df.set_index("time_slot"), height=300)
+        st.line_chart(wide_df.set_index("time_slot"), height=300)
 
 
 # ----------------------------------------
@@ -346,7 +356,7 @@ else:
 本应用提供：
 1. 模型管理：删除、打包下载、多选管理；点击模型可查看断点与训练数据。
 2. 模型训练：上传Excel/CSV，训练并保存模型（带元数据和训练数据）。
-3. 日前价格预测：选择已训练模型进行预测。
+3. 日前价格预测：支持选择多个模型，叠加展示预测结果，并仅导出预测结果。
 4. 数据浏览与筛选：展示 data/marginal.csv。
 
 底层逻辑见 model_utils.py。
