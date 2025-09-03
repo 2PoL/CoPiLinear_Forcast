@@ -1,24 +1,115 @@
+import io
+import zipfile
+
 import streamlit as st
 import pandas as pd
 import numpy as np
+
 from model_utils import (
     DATA_PATH,
-    train_model,
     list_models,
     load_model,
     predict_price,
+    train_model_ex,
+    load_model_meta,
+    delete_models,
 )
 
-st.set_page_config(page_title="", layout="wide")
 
+st.set_page_config(page_title="CoPiLinear 工具", layout="wide")
 st.title("CoPiLinear 模型工具")
 
-MENU = st.sidebar.radio("导航", ["模型训练", "日前价格预测", "数据展示", "关于"])
+MENU = st.sidebar.radio("导航", ["模型管理", "模型训练", "日前价格预测", "数据展示", "关于"])
+
 
 # ----------------------------------------
-# 1) 训练页面
+# 1) 模型管理
 # ----------------------------------------
-if MENU == "模型训练":
+if MENU == "模型管理":
+    st.subheader("模型管理")
+    models = list_models()
+    if not models:
+        st.info("暂无模型，请先到‘模型训练’页创建模型。")
+    else:
+        selected = st.multiselect("选择模型（用于批量操作）", models)
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("删除所选模型"):
+                if not selected:
+                    st.warning("请先选择至少一个模型")
+                else:
+                    summary = delete_models(selected)
+                    st.success(f"已删除: {', '.join(summary.get('removed', []))}")
+                    if summary.get('missing'):
+                        st.info(f"未找到: {', '.join(summary['missing'])}")
+        with col_b:
+            if st.button("打包下载所选模型"):
+                if not selected:
+                    st.warning("请先选择至少一个模型")
+                else:
+                    buf = io.BytesIO()
+                    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                        for name in selected:
+                            for ext in (".pkl", ".meta.json", ".train.csv"):
+                                path = f"models/{name}{ext}"
+                                try:
+                                    with open(path, "rb") as f:
+                                        zf.writestr(f"{name}/{name}{ext}", f.read())
+                                except Exception:
+                                    pass
+                    st.download_button(
+                        "下载ZIP",
+                        data=buf.getvalue(),
+                        file_name="models_selected.zip",
+                        mime="application/zip",
+                    )
+
+        st.markdown("---")
+        st.write("模型列表与详情：")
+        for name in models:
+            with st.expander(name, expanded=False):
+                meta = load_model_meta(name)
+                if meta:
+                    st.write(f"创建时间: {meta.get('created_at')}")
+                    st.write(f"分段数: {meta.get('n_segments')}  IQR因子: {meta.get('iqr_factor')}")
+                    bps = meta.get('breakpoints')
+                    if bps is not None:
+                        st.write(f"断点: {np.round(np.array(bps), 4)}")
+                    st.write(f"训练数据来源: {meta.get('source')}")
+                else:
+                    st.info("缺少元数据（meta），仅提供模型文件操作。")
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    try:
+                        with open(f"models/{name}.pkl", "rb") as f:
+                            st.download_button("下载模型(.pkl)", f, file_name=f"{name}.pkl")
+                    except Exception:
+                        st.warning("模型文件缺失")
+                with c2:
+                    try:
+                        with open(f"models/{name}.train.csv", "rb") as f:
+                            st.download_button("下载训练数据", f, file_name=f"{name}.train.csv")
+                    except Exception:
+                        st.info("无训练数据文件")
+                with c3:
+                    if st.button(f"删除 {name}"):
+                        delete_models([name])
+                        st.success(f"已删除 {name}")
+
+                # 训练数据预览
+                try:
+                    train_df = pd.read_csv(f"models/{name}.train.csv")
+                    st.write(f"训练数据行数: {len(train_df):,}")
+                    st.dataframe(train_df.head(10))
+                except Exception:
+                    pass
+
+
+# ----------------------------------------
+# 2) 模型训练
+# ----------------------------------------
+elif MENU == "模型训练":
     st.subheader("模型训练")
     file = st.file_uploader("上传训练用 Excel 或 CSV", type=["xlsx", "csv"])
     model_name = st.text_input("模型名称", value="model_v1").strip()
@@ -34,23 +125,24 @@ if MENU == "模型训练":
             st.stop()
         df = pd.read_excel(file) if file.name.lower().endswith(".xlsx") else pd.read_csv(file)
         try:
-            model, breakpoints = train_model(
+            model, breakpoints = train_model_ex(
                 df,
                 model_name=model_name,
                 n_segments=n_segments,
                 iqr_factor=iqr_factor,
+                source=file.name,
             )
             st.success(f"训练完成：{model_name}，断点：{np.round(breakpoints, 4)}")
         except Exception as e:
             st.error(f"训练失败：{e}")
 
+
 # ----------------------------------------
-# 2) 预测页面
+# 3) 日前价格预测
 # ----------------------------------------
 elif MENU == "日前价格预测":
     st.subheader("根据负荷率预测日前价格")
 
-    # 选择模型
     models = list_models()
     if not models:
         st.warning("暂无可用模型，请先在‘模型训练’页训练并保存模型。")
@@ -61,7 +153,6 @@ elif MENU == "日前价格预测":
         st.error("模型加载失败")
         st.stop()
 
-    # 上传预测数据
     file = st.file_uploader("上传含负荷率列的 CSV/XLSX", type=["csv", "xlsx"])
     x_col = st.text_input("负荷率列名称", "load_rate")
     if st.button("预测") and file:
@@ -84,8 +175,9 @@ elif MENU == "日前价格预测":
         })
         st.line_chart(chart_df.set_index("time_slot"), height=300)
 
+
 # ----------------------------------------
-# 3) 数据展示
+# 4) 数据展示
 # ----------------------------------------
 elif MENU == "数据展示":
     st.subheader("CSV 数据展示与筛选")
@@ -243,17 +335,19 @@ elif MENU == "数据展示":
                 value_counts = display_df[chart_col].value_counts().head(20)
                 st.bar_chart(value_counts)
 
+
 # ----------------------------------------
-# 4) 关于
+# 5) 关于
 # ----------------------------------------
 else:
     st.markdown(
         """
 ### 关于
 本应用提供：
-1. 模型训练（上传Excel/CSV，训练并保存模型）。
-2. 日前价格预测（选择已训练模型进行预测）。
-3. 数据浏览和筛选（展示 data/marginal.csv）。
+1. 模型管理：删除、打包下载、多选管理；点击模型可查看断点与训练数据。
+2. 模型训练：上传Excel/CSV，训练并保存模型（带元数据和训练数据）。
+3. 日前价格预测：选择已训练模型进行预测。
+4. 数据浏览与筛选：展示 data/marginal.csv。
 
 底层逻辑见 model_utils.py。
         """
