@@ -114,7 +114,7 @@ if MENU == "模型管理":
 # ----------------------------------------
 elif MENU == "模型训练":
     st.subheader("模型训练")
-    file = st.file_uploader("上传训练用 Excel 或 CSV", type=["xlsx", "csv"])
+    file = st.file_uploader("上传训练用 Excel", type=["xlsx", "csv"])
     model_name = st.text_input("模型名称", value="model_v1").strip()
     n_segments = st.slider("分段数 (pwlf)", min_value=2, max_value=8, value=3)
     iqr_factor = st.slider("IQR 去极值因子", 0.5, 5.0, 1.5, 0.1)
@@ -141,10 +141,10 @@ elif MENU == "模型训练":
 
 
 # ----------------------------------------
-# 3) 日前价格预测（容量→负荷率→价格，多模型叠加）
+# 3) 日前价格预测
 # ----------------------------------------
 elif MENU == "日前价格预测":
-    st.subheader("多模型日前价格预测（容量→负荷率）")
+    st.subheader("多模型日前价格预测")
 
     models = list_models()
     if not models:
