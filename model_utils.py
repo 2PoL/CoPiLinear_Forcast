@@ -60,11 +60,18 @@ def clean_marginal_data(df: pd.DataFrame, iqr_factor: float = 3.0) -> pd.DataFra
 
     df = df.dropna(subset=['price', 'load_rate'])
 
-    # 4) IQR 去离群
-    q1, q3 = df['price'].quantile([0.25, 0.75])
-    iqr = q3 - q1
-    lower, upper = q1 - iqr_factor * iqr, q3 + iqr_factor * iqr
-    df = df[(df['price'] >= lower) & (df['price'] <= upper)].reset_index(drop=True)
+    # 4) IQR 去离群：仅对非零价格做 IQR，保留正常的 0 价格行
+    mask_zero_price = df["price"] == 0
+    price_for_iqr = df.loc[~mask_zero_price, "price"]
+    if len(price_for_iqr) >= 4:
+        q1, q3 = price_for_iqr.quantile([0.25, 0.75])
+        iqr = q3 - q1
+        lower, upper = q1 - iqr_factor * iqr, q3 + iqr_factor * iqr
+        keep_mask = mask_zero_price | ((df["price"] >= lower) & (df["price"] <= upper))
+        df = df[keep_mask].reset_index(drop=True)
+    else:
+        # 样本数量过少，不做 IQR 过滤
+        df = df.reset_index(drop=True)
     return df
 
 # ------------------------------------
@@ -131,7 +138,8 @@ def load_or_train_model(n_segments: int = 3) -> Optional[pwlf.PiecewiseLinFit]:
 
 
 def predict_price(model: pwlf.PiecewiseLinFit, x: np.ndarray) -> np.ndarray:
-    return model.predict(x)
+    # Clamp predictions to non-negative to avoid spurious negatives from extrapolation
+    return np.clip(model.predict(x), 0, None)
 
 
 # -------------------------------------------------
