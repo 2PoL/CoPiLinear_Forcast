@@ -179,25 +179,50 @@ elif MENU == "日前价格预测":
         st.warning("请至少选择一个模型")
         st.stop()
 
-    capacity = st.number_input("日前在线机组容量 (MW)", min_value=0.0, value=1000.0, step=10.0)
+    cap_input = st.text_input("日前在线机组容量 (MW，多值用逗号/空格分隔)", value="45000, 50000, 55000")
+    capacities = []
+    for part in cap_input.replace("，", ",").replace(" ", ",").split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            v = float(p)
+        except ValueError:
+            st.error(f"容量值无法解析：'{p}'")
+            st.stop()
+        if v <= 0:
+            st.error("容量必须大于 0 MW")
+            st.stop()
+        capacities.append(v)
+    if not capacities:
+        st.info("请输入至少一个正的容量值")
+
     file = st.file_uploader("上传包含“竞价空间”列的 CSV/XLSX", type=["csv", "xlsx"])
     if st.button("预测") and file:
         df = pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
-        if capacity <= 0:
-            st.error("容量必须大于 0 MW")
+        if not capacities:
+            st.error("容量不能为空")
             st.stop()
-        # 自动识别“竞价空间”列
+        # 规范化列名后查找“竞价空间”
+        def _normalize_col(col: str) -> str:
+            s = str(col)
+            for ch in [" ", "\u3000", "\t", "\n", "\r"]:
+                s = s.replace(ch, "")
+            return s.replace("（", "(").replace("）", ")")
+
+        norm_map = {_normalize_col(c): c for c in df.columns}
         space_col = None
         for cand in ["竞价空间(MW)", "竞价空间"]:
-            if cand in df.columns:
-                space_col = cand
+            norm_cand = _normalize_col(cand)
+            if norm_cand in norm_map:
+                space_col = norm_map[norm_cand]
                 break
         if space_col is None:
-            fuzzy = [c for c in df.columns if ("竞价" in str(c)) and ("空间" in str(c))]
+            fuzzy = [orig for norm, orig in norm_map.items() if ("竞价" in norm) and ("空间" in norm)]
             if fuzzy:
                 space_col = fuzzy[0]
         if space_col is None:
-            st.error("未找到包含“竞价空间”的列")
+            st.error(f"未找到包含“竞价空间”的列，当前列名：{list(df.columns)}")
             st.stop()
 
         space_vals = pd.to_numeric(df[space_col], errors="coerce").values
@@ -205,37 +230,27 @@ elif MENU == "日前价格预测":
             st.error("“竞价空间”列无法解析为数值，请检查数据")
             st.stop()
 
-        # 负荷率(%) = 竞价空间 / 日前在线机组容量(MW) * 100
-        load_rate = (space_vals / capacity) * 100.0
-
-        preds_map = {}
-        for name in selected_models:
-            m = load_model(name)
-            if m is None:
-                st.warning(f"模型 '{name}' 加载失败，已跳过")
-                continue
-            preds_map[name] = predict_price(m, load_rate)
-        if not preds_map:
-            st.error("没有可用预测结果")
-            st.stop()
-
         # 生成 15 分钟粒度时间标签（若为 96 条则最后为 24:00）
-        _mins = np.arange(1, len(load_rate) + 1) * 15
+        _mins = np.arange(1, len(space_vals) + 1) * 15
         _hrs = _mins // 60
         _mm = _mins % 60
         time_labels = [f"{int(h):02d}:{int(m):02d}" for h, m in zip(_hrs, _mm)]
 
-        # 表格显示：包括容量与负荷率
-        display_df = pd.DataFrame({
-            "time_slot": time_labels,
-            "日前在线机组容量 (MW)": np.full(len(time_labels), capacity, dtype=float),
-            "负荷率(%)": load_rate,
-        })
-        for name, arr in preds_map.items():
-            display_df[name] = arr
+        # 多容量预测：为每个容量计算负荷率和各模型价格
+        display_df = pd.DataFrame({"time_slot": time_labels})
+        for cap in capacities:
+            load_rate = (space_vals / cap) * 100.0
+            display_df[f"负荷率(%)@{cap}MW"] = load_rate
+            for name in selected_models:
+                m = load_model(name)
+                if m is None:
+                    st.warning(f"模型 '{name}' 加载失败，已跳过")
+                    continue
+                preds = predict_price(m, load_rate)
+                display_df[f"{name}@{cap}MW"] = preds
         st.dataframe(display_df.head())
 
-        # 下载结果：包含 time_slot、容量、负荷率、各模型预测价格
+        # 下载结果：包含 time_slot、各容量对应负荷率、各模型预测价格
         download_df = display_df.copy()
         st.download_button(
             "下载预测结果",
@@ -244,7 +259,7 @@ elif MENU == "日前价格预测":
         )
 
         # 图表：仅显示各模型预测，不显示容量与负荷率；Y 轴锁定 0-1500，X 轴包含 24:00
-        model_cols = [c for c in download_df.columns if c not in ["time_slot", "日前在线机组容量 (MW)", "负荷率(%)"]]
+        model_cols = [c for c in download_df.columns if c not in ["time_slot"] and not c.startswith("负荷率(%)@")]
         chart_df = download_df[["time_slot", *model_cols]].melt('time_slot', var_name='model', value_name='price')
         hour_ticks = [t for t in time_labels if t.endswith(':00')]
         if '24:00' in time_labels and '24:00' not in hour_ticks:
