@@ -11,6 +11,7 @@ from model_utils import (
     list_models,
     load_model,
     predict_price,
+    clean_marginal_data,
     train_model_ex,
     load_model_meta,
     delete_models,
@@ -155,6 +156,38 @@ elif MENU == "模型训练":
                 source=file.name,
             )
             st.success(f"训练完成：{model_name}，断点：{np.round(breakpoints, 4)}")
+
+            cleaned = clean_marginal_data(df.copy())
+            scatter_df = cleaned[["load_rate", "price"]].copy()
+            x_line = np.linspace(scatter_df["load_rate"].min(), scatter_df["load_rate"].max(), 200)
+            line_df = pd.DataFrame(
+                {
+                    "load_rate": x_line,
+                    "price": predict_price(model, x_line),
+                }
+            )
+            bp_df = pd.DataFrame({"load_rate": np.asarray(breakpoints)})
+
+            points = (
+                alt.Chart(scatter_df)
+                .mark_point(opacity=0.4, size=35)
+                .encode(
+                    x=alt.X("load_rate:Q", title="负荷率(%)"),
+                    y=alt.Y("price:Q", title="价格"),
+                )
+            )
+            line = (
+                alt.Chart(line_df)
+                .mark_line(color="#d62728", strokeWidth=2)
+                .encode(x="load_rate:Q", y="price:Q")
+            )
+            rules = (
+                alt.Chart(bp_df)
+                .mark_rule(color="#7f7f7f", strokeDash=[4, 4])
+                .encode(x="load_rate:Q")
+            )
+
+            st.altair_chart((points + line + rules).properties(title="负荷率拟合图"), use_container_width=True)
         except Exception as e:
             st.error(f"训练失败：{e}")
 
