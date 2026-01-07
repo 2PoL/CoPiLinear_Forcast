@@ -9,7 +9,6 @@ import numpy as np
 import pandas as pd
 import pwlf
 import pickle
-from scipy import stats
 
 # Application paths
 DATA_PATH = Path("data/marginal.csv")
@@ -23,7 +22,7 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 # Data cleaning (mirrors reappropriation.py)
 # -------------------------------------------
 
-def clean_marginal_data(df: pd.DataFrame, iqr_factor: float = 3.0) -> pd.DataFrame:
+def clean_marginal_data(df: pd.DataFrame) -> pd.DataFrame:
     """Standardise column names, coerce dtypes, drop NaNs & outliers."""
     # Flexible rename map – extend if needed
 
@@ -74,19 +73,6 @@ def clean_marginal_data(df: pd.DataFrame, iqr_factor: float = 3.0) -> pd.DataFra
     df = df.dropna(subset=['price', 'load_rate'])
     # Drop invalid load rates to avoid negative breakpoints in pwlf
     df = df[(df['load_rate'] > 0) & (df['load_rate'] <= 100)].reset_index(drop=True)
-
-    # 4) IQR 去离群
-    mask_zero_price = df["price"] == 0
-    price_for_iqr = df.loc[~mask_zero_price, "price"]
-    if len(price_for_iqr) >= 4:
-        q1, q3 = price_for_iqr.quantile([0.25, 0.75])
-        iqr = q3 - q1
-        lower, upper = q1 - iqr_factor * iqr, q3 + iqr_factor * iqr
-        keep_mask = mask_zero_price | ((df["price"] >= lower) & (df["price"] <= upper))
-        df = df[keep_mask].reset_index(drop=True)
-    else:
-        # 样本数量过少，不做 IQR 过滤
-        df = df.reset_index(drop=True)
     return df
 
 # ------------------------------------
@@ -98,14 +84,13 @@ def train_model(
     model_name: str,
     *,
     n_segments: int = 3,
-    iqr_factor: float = 3.0,
 ) -> Tuple[pwlf.PiecewiseLinFit, np.ndarray]:
     """Train pwlf model on provided DataFrame and save to models/{model_name}.pkl
 
     The input DataFrame is cleaned via clean_marginal_data.
     Returns (model, breakpoints).
     """
-    cleaned = clean_marginal_data(df.copy(), iqr_factor=iqr_factor)
+    cleaned = clean_marginal_data(df.copy())
     x = cleaned["load_rate"].values
     y = cleaned["price"].values
     if len(x) < max(2, n_segments + 1):
@@ -178,7 +163,6 @@ def train_model_ex(
     model_name: str,
     *,
     n_segments: int = 3,
-    iqr_factor: float = 1.5,
     source: Optional[str] = None,
 ) -> Tuple[pwlf.PiecewiseLinFit, np.ndarray]:
     """Train + save model, metadata, and cleaned training data.
@@ -186,7 +170,7 @@ def train_model_ex(
     This does not modify legacy train_model; callers should use this function
     to ensure artifacts exist for management UI.
     """
-    cleaned = clean_marginal_data(df.copy(), iqr_factor=iqr_factor)
+    cleaned = clean_marginal_data(df.copy())
     x = cleaned["load_rate"].values
     y = cleaned["price"].values
     if len(x) < max(2, n_segments + 1):
@@ -202,7 +186,6 @@ def train_model_ex(
         "name": model_name,
         "created_at": datetime.utcnow().isoformat() + "Z",
         "n_segments": n_segments,
-        "iqr_factor": iqr_factor,
         "rows": int(len(cleaned)),
         "source": source or "unknown",
         "breakpoints": [float(v) for v in np.asarray(breakpoints).tolist()],

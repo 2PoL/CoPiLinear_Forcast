@@ -44,7 +44,6 @@ if MENU == "模型管理":
                 "名称": name,
                 "创建时间": meta.get("created_at"),
                 "分段数": meta.get("n_segments"),
-                "IQR因子": meta.get("iqr_factor"),
                 "样本行数": meta.get("rows"),
                 "数据来源": meta.get("source"),
                 "断点": ", ".join([f"{v:.4f}" for v in meta.get("breakpoints", [])]) if meta.get("breakpoints") else None,
@@ -72,7 +71,6 @@ if MENU == "模型管理":
             "名称": st.column_config.TextColumn("名称", disabled=True),
             "创建时间": st.column_config.TextColumn("创建时间", disabled=True),
             "分段数": st.column_config.NumberColumn("分段数", disabled=True),
-            "IQR因子": st.column_config.NumberColumn("IQR因子", disabled=True),
             "样本行数": st.column_config.NumberColumn("样本行数", disabled=True),
             "数据来源": st.column_config.TextColumn("数据来源", disabled=True),
             "断点": st.column_config.TextColumn("断点", disabled=True),
@@ -98,7 +96,6 @@ if MENU == "模型管理":
             meta = load_model_meta(name)
             if meta:
                 st.write(f"创建时间: {meta.get('created_at')}")
-                st.write(f"分段数: {meta.get('n_segments')}  IQR因子: {meta.get('iqr_factor')}")
                 bps = meta.get('breakpoints')
                 if bps is not None:
                     st.write(f"断点: {np.round(np.array(bps), 4)}")
@@ -141,7 +138,6 @@ elif MENU == "模型训练":
     file = st.file_uploader("上传训练数据 Excel/CSV", type=["xlsx", "csv"])
     model_name = st.text_input("模型名称", value="model_v1").strip()
     n_segments = st.slider("分段数 (pwlf)", min_value=2, max_value=8, value=3)
-    iqr_factor = st.slider("IQR 去极值因子", 0.5, 5.0, 1.5, 0.1)
 
     if st.button("训练模型"):
         if not file:
@@ -156,7 +152,6 @@ elif MENU == "模型训练":
                 df,
                 model_name=model_name,
                 n_segments=n_segments,
-                iqr_factor=iqr_factor,
                 source=file.name,
             )
             st.success(f"训练完成：{model_name}，断点：{np.round(breakpoints, 4)}")
