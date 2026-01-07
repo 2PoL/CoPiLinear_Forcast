@@ -39,14 +39,27 @@ def clean_marginal_data(df: pd.DataFrame, iqr_factor: float = 3.0) -> pd.DataFra
         'time_slot': 'time_slot',
 
         '(调控后)日前出清价格(元/MWh)': 'price',
+        '日前出清价格(元/MWh)': 'price',
         '价格': 'price',
         'price': 'price',
 
         '日前负荷率(%)': 'load_rate',
+        '负荷率(%)': 'load_rate',
         '负荷率': 'load_rate',
         'load_rate': 'load_rate',
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    # Template fallback: derive load_rate if only capacity + space are provided.
+    if (
+        'load_rate' not in df.columns
+        and '竞价空间(MW)' in df.columns
+        and '在线机组容量(MW)' in df.columns
+    ):
+        df['load_rate'] = (
+            pd.to_numeric(df['竞价空间(MW)'], errors='coerce')
+            / pd.to_numeric(df['在线机组容量(MW)'], errors='coerce')
+        ) * 100.0
 
     required = ['date', 'time_slot', 'price', 'load_rate']
     missing = [c for c in required if c not in df.columns]
@@ -59,8 +72,10 @@ def clean_marginal_data(df: pd.DataFrame, iqr_factor: float = 3.0) -> pd.DataFra
     df['load_rate'] = pd.to_numeric(df['load_rate'], errors='coerce')
 
     df = df.dropna(subset=['price', 'load_rate'])
+    # Drop invalid load rates to avoid negative breakpoints in pwlf
+    df = df[(df['load_rate'] > 0) & (df['load_rate'] <= 100)].reset_index(drop=True)
 
-    # 4) IQR 去离群：仅对非零价格做 IQR，保留正常的 0 价格行
+    # 4) IQR 去离群
     mask_zero_price = df["price"] == 0
     price_for_iqr = df.loc[~mask_zero_price, "price"]
     if len(price_for_iqr) >= 4:
