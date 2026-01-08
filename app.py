@@ -97,7 +97,7 @@ if MENU == "模型管理":
         edited = st.data_editor(
             view_df,
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             column_config=col_cfg,
         )
 
@@ -299,7 +299,7 @@ elif MENU == "模型训练":
                 .encode(x="load_rate:Q")
             )
 
-            st.altair_chart((points + line + rules).properties(title="负荷率拟合图"), use_container_width=True)
+            st.altair_chart((points + line + rules).properties(title="负荷率拟合图"), width="stretch")
         except Exception as e:
             st.error(f"训练失败：{e}")
 
@@ -414,7 +414,7 @@ elif MENU == "日前价格预测":
             )
             .properties(height=300)
         )
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(chart, width="stretch")
 
 
 else:
