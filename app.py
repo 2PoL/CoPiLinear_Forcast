@@ -1,6 +1,8 @@
 import io
 import os
 import zipfile
+from datetime import date, timedelta
+from typing import Optional
 
 import streamlit as st
 import pandas as pd
@@ -15,7 +17,21 @@ from model_utils import (
     train_model_ex,
     load_model_meta,
     delete_models,
+    load_dataset_config,
+    update_dataset_config,
+    get_dataset_status,
+    sync_dataset_from_excel,
+    fetch_dataset,
 )
+
+
+def _parse_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 st.set_page_config(page_title="CoPiLinear", layout="wide")
@@ -135,29 +151,124 @@ if MENU == "模型管理":
 # 2) 模型训练
 # ----------------------------------------
 elif MENU == "模型训练":
+    st.subheader("数据源管理")
+    dataset_status = get_dataset_status()
+    cfg = load_dataset_config()
+
+    with st.form("dataset_config_form"):
+        cols = st.columns([3, 1])
+        excel_path = cols[0].text_input("市场边际 Excel 路径", value=cfg.get("excel_path", ""))
+        sheet_name = cols[1].text_input("工作表名称(可选)", value=cfg.get("sheet_name", ""))
+        if st.form_submit_button("保存配置"):
+            cfg = update_dataset_config({"excel_path": excel_path, "sheet_name": sheet_name})
+            dataset_status = get_dataset_status()
+            st.success("配置已保存")
+
+    force_sync = st.checkbox("忽略缓存强制刷新", value=False)
+    if st.button("刷新数据库", type="primary"):
+        try:
+            result = sync_dataset_from_excel(force=force_sync)
+            dataset_status = get_dataset_status()
+            st.success(f"已导入 {result['rows']:,} 行数据")
+        except Exception as e:
+            st.error(f"刷新失败：{e}")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("状态", dataset_status["state_label"], dataset_status.get("status_reason") or "")
+    c2.metric("数据库行数", f"{dataset_status['row_count']:,}")
+    c3.metric("上次同步", dataset_status.get("last_sync_time") or "—")
+    if dataset_status.get("excel_path"):
+        st.caption(f"Excel: {dataset_status['excel_path']}")
+    if dataset_status.get("excel_mtime_human"):
+        st.caption(f"Excel 修改时间: {dataset_status['excel_mtime_human']}")
+
+    st.markdown("---")
     st.subheader("模型训练")
-    file = st.file_uploader("上传训练数据 Excel/CSV", type=["xlsx", "csv"])
+    data_source = st.radio("训练数据来源", ["上传文件", "数据库"], horizontal=True)
+
+    upload_file = None
+    db_start: Optional[date] = None
+    db_end: Optional[date] = None
+
+    if data_source == "上传文件":
+        upload_file = st.file_uploader("上传训练数据 Excel/CSV", type=["xlsx", "csv"])
+    else:
+        if dataset_status["row_count"] == 0:
+            st.info("数据库为空，请先完成 Excel 导入。")
+        min_date = _parse_date(dataset_status.get("date_min"))
+        max_date = _parse_date(dataset_status.get("date_max"))
+        today = date.today()
+        default_end = max_date or today
+        default_start = default_end - timedelta(days=30)
+        if min_date:
+            default_start = max(min_date, default_start)
+        cols = st.columns(2)
+        db_start = cols[0].date_input(
+            "起始日期",
+            value=default_start,
+            min_value=min_date or default_start,
+            max_value=default_end,
+        )
+        db_end = cols[1].date_input(
+            "结束日期",
+            value=default_end,
+            min_value=db_start,
+            max_value=max_date or default_end,
+        )
+        st.caption(
+            f"可用数据区间：{dataset_status.get('date_min') or '未知'} 至 {dataset_status.get('date_max') or '未知'}"
+        )
+
     model_name = st.text_input("模型名称", value="model_v1").strip()
     n_segments = st.slider("分段数 (pwlf)", min_value=2, max_value=8, value=3)
 
     if st.button("训练模型"):
-        if not file:
-            st.warning("请先上传训练数据文件")
+        df_source = None
+        source_label = None
+
+        if data_source == "上传文件":
+            if not upload_file:
+                st.warning("请先上传训练数据文件")
+            else:
+                suffix = upload_file.name.lower()
+                if suffix.endswith(".xlsx") or suffix.endswith(".xls"):
+                    df_source = pd.read_excel(upload_file, header=None)
+                else:
+                    df_source = pd.read_csv(upload_file, header=None)
+                source_label = upload_file.name
+        else:
+            if dataset_status["row_count"] == 0:
+                st.warning("数据库为空，请先导入数据")
+            elif not db_start or not db_end:
+                st.warning("请选择完整的日期范围")
+            elif db_start > db_end:
+                st.warning("起始日期需早于结束日期")
+            else:
+                df = fetch_dataset(db_start, db_end)
+                if df.empty:
+                    st.warning("所选日期范围没有数据")
+                else:
+                    df_source = df
+                    source_label = f"sqlite:{db_start}->{db_end}"
+
+        if df_source is None:
             st.stop()
         if not model_name:
             st.warning("请填写模型名称")
             st.stop()
-        df = pd.read_excel(file) if file.name.lower().endswith(".xlsx") else pd.read_csv(file)
+
         try:
             model, breakpoints = train_model_ex(
-                df,
+                df_source,
                 model_name=model_name,
                 n_segments=n_segments,
-                source=file.name,
+                source=source_label,
             )
-            st.success(f"训练完成：{model_name}，断点：{np.round(breakpoints, 4)}")
+            st.success(
+                f"训练完成：{model_name}，断点：{np.round(breakpoints, 4)}，来源：{source_label or 'unknown'}"
+            )
 
-            cleaned = clean_marginal_data(df.copy())
+            cleaned = clean_marginal_data(df_source.copy())
             scatter_df = cleaned[["load_rate", "price"]].copy()
             x_line = np.linspace(scatter_df["load_rate"].min(), scatter_df["load_rate"].max(), 200)
             line_df = pd.DataFrame(
@@ -307,4 +418,3 @@ elif MENU == "日前价格预测":
 
 else:
     st.stop()
-
