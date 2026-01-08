@@ -126,6 +126,14 @@ RAW_TABLE_CORE_COLUMNS = [
 
 RAW_TABLE_COLUMNS = RAW_TABLE_CORE_COLUMNS + ['extras_json']
 
+
+def _to_json_safe(value: Any) -> Any:
+    if isinstance(value, (np.generic,)):
+        return value.item()
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    return value
+
 # -------------------------------------------
 # Data cleaning (mirrors reappropriation.py)
 # -------------------------------------------
@@ -412,6 +420,12 @@ def _count_rows(conn: sqlite3.Connection) -> int:
     return int(cur.fetchone()[0])
 
 
+def _count_raw_rows(conn: sqlite3.Connection) -> int:
+    cur = conn.execute("SELECT COUNT(*) FROM raw_marginal_data")
+    row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 def _get_date_span(conn: sqlite3.Connection) -> Tuple[Optional[str], Optional[str]]:
     cur = conn.execute("SELECT MIN(date), MAX(date) FROM marginal_data")
     row = cur.fetchone()
@@ -486,9 +500,13 @@ def _replace_raw_table(conn: sqlite3.Connection, df: pd.DataFrame, extras_cols: 
             if col in record:
                 value = record[col]
                 if pd.notna(value):
-                    extras_payload[col] = value
+                    extras_payload[col] = _to_json_safe(value)
         extras_json = json.dumps(extras_payload, ensure_ascii=False) if extras_payload else None
         row_values = [record.get(col) for col in RAW_TABLE_CORE_COLUMNS]
+        if row_values:
+            boundary_idx = RAW_TABLE_CORE_COLUMNS.index('boundary_type')
+            if row_values[boundary_idx] is None:
+                row_values[boundary_idx] = ''
         rows.append(tuple(row_values + [extras_json]))
     conn.execute("DELETE FROM raw_marginal_data")
     conn.executemany(
@@ -569,6 +587,7 @@ def sync_dataset_from_excel(force: bool = False) -> Dict[str, Any]:
     sheet_name = cfg.get("sheet_name", "").strip() or None
 
     raw_df = _load_source_frame(source_path, sheet_name)
+    raw_prepared, raw_extra_cols = _prepare_raw_dataframe(raw_df.copy())
     cleaned = clean_marginal_data(raw_df.copy())
     cleaned = cleaned.sort_values(["date", "time_slot"]).reset_index(drop=True)
     if cleaned.empty:
@@ -582,7 +601,17 @@ def sync_dataset_from_excel(force: bool = False) -> Dict[str, Any]:
         meta = _get_meta_dict(conn)
         previous_hash = meta.get("last_hash") if meta else None
         previous_rows = _count_rows(conn)
-        if (not force) and previous_hash == fingerprint and previous_rows == len(cleaned):
+        raw_rows_meta = meta.get("last_raw_row_count") if meta else None
+        raw_rows_meta_val = int(raw_rows_meta) if raw_rows_meta else None
+        raw_rows_current = _count_raw_rows(conn)
+        raw_ready = meta.get("raw_table_ready") == "1" if meta else False
+        raw_consistent = (
+            raw_ready
+            and raw_rows_meta_val is not None
+            and raw_rows_meta_val == len(raw_prepared)
+            and raw_rows_current == raw_rows_meta_val
+        )
+        if (not force) and previous_hash == fingerprint and previous_rows == len(cleaned) and raw_consistent:
             return {
                 "status": "skipped",
                 "reason": "数据无变化",
@@ -596,6 +625,7 @@ def sync_dataset_from_excel(force: bool = False) -> Dict[str, Any]:
             "INSERT INTO marginal_data(date, time_slot, price, load_rate) VALUES (?, ?, ?, ?)",
             cleaned[["date", "time_slot", "price", "load_rate"]].itertuples(index=False, name=None),
         )
+        _replace_raw_table(conn, raw_prepared, raw_extra_cols)
 
         now_iso = datetime.utcnow().isoformat() + "Z"
         _set_meta_bulk(
@@ -607,6 +637,8 @@ def sync_dataset_from_excel(force: bool = False) -> Dict[str, Any]:
                 "last_excel_mtime": excel_mtime,
                 "last_row_count": len(cleaned),
                 "last_sheet_name": sheet_name or "",
+                "raw_table_ready": "1",
+                "last_raw_row_count": len(raw_prepared),
             },
         )
 
