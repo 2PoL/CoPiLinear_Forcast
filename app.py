@@ -35,6 +35,14 @@ def _parse_date(value: Optional[str]) -> Optional[date]:
         return None
 
 
+def _altair_chart(chart, *, width: str = "stretch") -> None:
+    try:
+        st.altair_chart(chart, width=width)
+    except TypeError:
+        # Backward-compatible fallback for older Streamlit versions.
+        st.altair_chart(chart, use_container_width=(width == "stretch"))
+
+
 st.set_page_config(page_title="CoPiLinear", layout="wide")
 st.title("CoPiLinear 价格预测工具")
 
@@ -299,7 +307,7 @@ elif MENU == "模型训练":
                 .encode(x="load_rate:Q")
             )
 
-            st.altair_chart((points + line + rules).properties(title="负荷率拟合图"), width="stretch")
+            _altair_chart((points + line + rules).properties(title="负荷率拟合图"), width="stretch")
         except Exception as e:
             st.error(f"训练失败：{e}")
 
@@ -414,7 +422,7 @@ elif MENU == "日前价格预测":
             )
             .properties(height=300)
         )
-        st.altair_chart(chart, width="stretch")
+        _altair_chart(chart, width="stretch")
 
 
 else:
