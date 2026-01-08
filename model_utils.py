@@ -9,7 +9,6 @@ import numpy as np
 import pandas as pd
 import pwlf
 import pickle
-from scipy import stats
 
 # Application paths
 DATA_PATH = Path("data/marginal.csv")
@@ -23,7 +22,7 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 # Data cleaning (mirrors reappropriation.py)
 # -------------------------------------------
 
-def clean_marginal_data(df: pd.DataFrame, iqr_factor: float = 3.0) -> pd.DataFrame:
+def clean_marginal_data(df: pd.DataFrame) -> pd.DataFrame:
     """Standardise column names, coerce dtypes, drop NaNs & outliers."""
     # Flexible rename map – extend if needed
 
@@ -39,14 +38,27 @@ def clean_marginal_data(df: pd.DataFrame, iqr_factor: float = 3.0) -> pd.DataFra
         'time_slot': 'time_slot',
 
         '(调控后)日前出清价格(元/MWh)': 'price',
+        '日前出清价格(元/MWh)': 'price',
         '价格': 'price',
         'price': 'price',
 
         '日前负荷率(%)': 'load_rate',
+        '负荷率(%)': 'load_rate',
         '负荷率': 'load_rate',
         'load_rate': 'load_rate',
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    # Template fallback: derive load_rate if only capacity + space are provided.
+    if (
+        'load_rate' not in df.columns
+        and '竞价空间(MW)' in df.columns
+        and '在线机组容量(MW)' in df.columns
+    ):
+        df['load_rate'] = (
+            pd.to_numeric(df['竞价空间(MW)'], errors='coerce')
+            / pd.to_numeric(df['在线机组容量(MW)'], errors='coerce')
+        ) * 100.0
 
     required = ['date', 'time_slot', 'price', 'load_rate']
     missing = [c for c in required if c not in df.columns]
@@ -59,12 +71,8 @@ def clean_marginal_data(df: pd.DataFrame, iqr_factor: float = 3.0) -> pd.DataFra
     df['load_rate'] = pd.to_numeric(df['load_rate'], errors='coerce')
 
     df = df.dropna(subset=['price', 'load_rate'])
-
-    # 4) IQR 去离群
-    q1, q3 = df['price'].quantile([0.25, 0.75])
-    iqr = q3 - q1
-    lower, upper = q1 - iqr_factor * iqr, q3 + iqr_factor * iqr
-    df = df[(df['price'] >= lower) & (df['price'] <= upper)].reset_index(drop=True)
+    # Drop invalid load rates to avoid negative breakpoints in pwlf
+    df = df[(df['load_rate'] > 0) & (df['load_rate'] <= 100)].reset_index(drop=True)
     return df
 
 # ------------------------------------
@@ -76,14 +84,13 @@ def train_model(
     model_name: str,
     *,
     n_segments: int = 3,
-    iqr_factor: float = 3.0,
 ) -> Tuple[pwlf.PiecewiseLinFit, np.ndarray]:
     """Train pwlf model on provided DataFrame and save to models/{model_name}.pkl
 
     The input DataFrame is cleaned via clean_marginal_data.
     Returns (model, breakpoints).
     """
-    cleaned = clean_marginal_data(df.copy(), iqr_factor=iqr_factor)
+    cleaned = clean_marginal_data(df.copy())
     x = cleaned["load_rate"].values
     y = cleaned["price"].values
     if len(x) < max(2, n_segments + 1):
@@ -131,7 +138,8 @@ def load_or_train_model(n_segments: int = 3) -> Optional[pwlf.PiecewiseLinFit]:
 
 
 def predict_price(model: pwlf.PiecewiseLinFit, x: np.ndarray) -> np.ndarray:
-    return model.predict(x)
+    # Clamp predictions to non-negative to avoid spurious negatives from extrapolation
+    return np.clip(model.predict(x), 0, None)
 
 
 # -------------------------------------------------
@@ -155,7 +163,6 @@ def train_model_ex(
     model_name: str,
     *,
     n_segments: int = 3,
-    iqr_factor: float = 1.5,
     source: Optional[str] = None,
 ) -> Tuple[pwlf.PiecewiseLinFit, np.ndarray]:
     """Train + save model, metadata, and cleaned training data.
@@ -163,7 +170,7 @@ def train_model_ex(
     This does not modify legacy train_model; callers should use this function
     to ensure artifacts exist for management UI.
     """
-    cleaned = clean_marginal_data(df.copy(), iqr_factor=iqr_factor)
+    cleaned = clean_marginal_data(df.copy())
     x = cleaned["load_rate"].values
     y = cleaned["price"].values
     if len(x) < max(2, n_segments + 1):
@@ -179,7 +186,6 @@ def train_model_ex(
         "name": model_name,
         "created_at": datetime.utcnow().isoformat() + "Z",
         "n_segments": n_segments,
-        "iqr_factor": iqr_factor,
         "rows": int(len(cleaned)),
         "source": source or "unknown",
         "breakpoints": [float(v) for v in np.asarray(breakpoints).tolist()],
