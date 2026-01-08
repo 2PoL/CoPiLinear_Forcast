@@ -22,6 +22,7 @@ from model_utils import (
     get_dataset_status,
     sync_dataset_from_excel,
     fetch_dataset,
+    format_time_shanghai,
 )
 
 
@@ -41,7 +42,7 @@ MENU = st.sidebar.radio("导航", ["模型管理", "模型训练", "日前价格
 
 
 # ----------------------------------------
-# 1) 模型管理（Notion 风格数据库）
+# 1) 模型管理
 # ----------------------------------------
 if MENU == "模型管理":
     st.subheader("模型数据库")
@@ -59,7 +60,7 @@ if MENU == "模型管理":
             rec = {
                 "选中": False,
                 "名称": name,
-                "创建时间": meta.get("created_at"),
+                "创建时间": format_time_shanghai(meta.get("created_at")),
                 "分段数": meta.get("n_segments"),
                 "样本行数": meta.get("rows"),
                 "数据来源": meta.get("source"),
@@ -112,7 +113,7 @@ if MENU == "模型管理":
             st.subheader(f"详情：{name}")
             meta = load_model_meta(name)
             if meta:
-                st.write(f"创建时间: {meta.get('created_at')}")
+                st.write(f"创建时间: {format_time_shanghai(meta.get('created_at'))}")
                 bps = meta.get('breakpoints')
                 if bps is not None:
                     st.write(f"断点: {np.round(np.array(bps), 4)}")

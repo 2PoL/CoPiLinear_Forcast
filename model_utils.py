@@ -10,6 +10,7 @@ import json
 import pickle
 import sqlite3
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -26,6 +27,7 @@ DATA_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 MODELS_DIR = Path("models")
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
+SH_TZ = ZoneInfo("Asia/Shanghai")
 
 DEFAULT_DATASET_CONFIG: Dict[str, Any] = {
     "excel_path": "",
@@ -435,7 +437,31 @@ def _get_date_span(conn: sqlite3.Connection) -> Tuple[Optional[str], Optional[st
 def _format_epoch(ts: Optional[float]) -> Optional[str]:
     if ts is None:
         return None
-    return datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+    return datetime.fromtimestamp(ts, SH_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _now_shanghai() -> datetime:
+    return datetime.now(SH_TZ)
+
+
+def format_time_shanghai(value: Optional[Any]) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, SH_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        else:
+            dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        return dt.astimezone(SH_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return text
 
 
 def _normalize_date(val: Optional[Any]) -> Optional[str]:
@@ -536,7 +562,7 @@ def get_dataset_status() -> Dict[str, Any]:
         meta = _get_meta_dict(conn)
         date_min, date_max = _get_date_span(conn)
 
-    last_sync = meta.get("last_sync_time") if meta else None
+    last_sync = format_time_shanghai(meta.get("last_sync_time") if meta else None)
     last_hash = meta.get("last_hash") if meta else None
     meta_row_count = meta.get("last_row_count") if meta else None
     last_row_count = int(meta_row_count) if meta_row_count else row_count
@@ -627,7 +653,7 @@ def sync_dataset_from_excel(force: bool = False) -> Dict[str, Any]:
         )
         _replace_raw_table(conn, raw_prepared, raw_extra_cols)
 
-        now_iso = datetime.utcnow().isoformat() + "Z"
+        now_iso = _now_shanghai().strftime("%Y-%m-%d %H:%M:%S")
         _set_meta_bulk(
             conn,
             {
@@ -711,7 +737,7 @@ def train_model_ex(
     cleaned.to_csv(p["train"], index=False)
     meta: Dict[str, Any] = {
         "name": model_name,
-        "created_at": datetime.utcnow().isoformat() + "Z",
+        "created_at": _now_shanghai().strftime("%Y-%m-%d %H:%M:%S"),
         "n_segments": n_segments,
         "rows": int(len(cleaned)),
         "source": source or "unknown",
