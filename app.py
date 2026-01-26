@@ -1,7 +1,8 @@
 import io
 import os
-import zipfile
+import shutil
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Optional
 
 import streamlit as st
@@ -17,13 +18,13 @@ from model_utils import (
     train_model_ex,
     load_model_meta,
     delete_models,
-    load_dataset_config,
-    update_dataset_config,
     get_dataset_status,
-    sync_dataset_from_excel,
+    preprocess_dataset_and_sync,
     fetch_dataset,
     format_time_shanghai,
 )
+
+from scripts.pre_process import preprocess_data, preprocess_template_file
 
 
 def _parse_date(value: Optional[str]) -> Optional[date]:
@@ -43,16 +44,282 @@ def _altair_chart(chart, *, width: str = "stretch") -> None:
         st.altair_chart(chart, use_container_width=(width == "stretch"))
 
 
+REQUIRED_BOUNDARY_FILES = [
+    "日前统调系统负荷预测_REPORT0.xlsx",
+    "日前新能源负荷预测_REPORT0.xlsx",
+    "披露信息96点数据_REPORT0.xlsx",
+    "日前联络线计划_REPORT0.xlsx",
+    "日前市场出清情况_TABLE.xlsx",
+    "日前水电计划发电总出力预测_REPORT0.xlsx",
+    "96点电网运行实际值_REPORT0.xlsx",
+    "实时联络线计划_REPORT0.xlsx",
+    "现货出清电价_REPORT0.xlsx",
+]
+
+PUBLIC_REALTIME_CAPACITY_LABEL = "公有数据看板-实时(天际云).xlsx"
+
+
+def _df_to_excel_bytes(df: pd.DataFrame, *, sheet_name: str = "合并数据") -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _clear_directory(path: Path) -> None:
+    if not path.exists():
+        return
+    for child in path.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def _persist_uploaded_files(files, dest_dir: Path) -> None:
+    stored_files = []
+    for file in files:
+        file.seek(0)
+        stored_files.append((file.name, file.getvalue()))
+    _clear_directory(dest_dir)
+    for name, content in stored_files:
+        with open(dest_dir / name, "wb") as f:
+            f.write(content)
+
+
 st.set_page_config(page_title="CoPiLinear", layout="wide")
 st.title("CoPiLinear 价格预测工具")
 
-MENU = st.sidebar.radio("导航", ["模型管理", "模型训练", "日前价格预测"])
+MENU = st.sidebar.radio("导航", ["数据预处理", "模型管理", "模型训练", "日前价格预测"])
+
+
+# ----------------------------------------
+# 0) 数据预处理
+# ----------------------------------------
+if MENU == "数据预处理":
+    st.subheader("预处理边界数据")
+    st.caption("上传 10 个边界 Excel 文件或 0市场边际数据库.xlsx 模板，完成数据清洗并导入数据库。")
+
+    margin_dir = Path("margin_data")
+    margin_dir.mkdir(parents=True, exist_ok=True)
+
+    import_mode = st.radio(
+        "导入方式",
+        ["逐文件合并（10 个文件）", "模板批量导入 (0市场边际数据库.xlsx)"],
+        horizontal=True,
+        key="preprocess_import_mode",
+    )
+
+    boundary_success: Optional[str] = None
+    boundary_error: Optional[str] = None
+
+    if import_mode == "逐文件合并（10 个文件）":
+        st.markdown("### 📤 上传边界数据文件")
+        st.warning("⚠️ 请上传以下 10 个必需的 Excel 文件：")
+        st.markdown(
+            """
+1. 日前统调系统负荷预测_REPORT0.xlsx  
+2. 日前新能源负荷预测_REPORT0.xlsx  
+3. 披露信息96点数据_REPORT0.xlsx  
+4. 日前联络线计划_REPORT0.xlsx  
+5. 日前市场出清情况_TABLE.xlsx  
+6. 日前水电计划发电总出力预测_REPORT0.xlsx  
+7. 96点电网运行实际值_REPORT0.xlsx  
+8. 实时联络线计划_REPORT0.xlsx  
+9. 现货出清电价_REPORT0.xlsx  
+10. 公有数据看板-实时（文件名包含日期范围）
+            """
+        )
+
+        boundary_files = st.file_uploader(
+            "选择Excel文件（支持多选）",
+            type=["xlsx"],
+            accept_multiple_files=True,
+            help="请一次性上传全部 10 个文件（含公有数据看板-实时）",
+            key="boundary_file_uploader",
+        )
+
+        required_status = {name: False for name in REQUIRED_BOUNDARY_FILES}
+        capacity_file_found = False
+        if boundary_files:
+            st.markdown(f"✅ 已选择 {len(boundary_files)} 个文件：")
+            for file in boundary_files:
+                st.write(f"  - {file.name}")
+                if file.name in required_status:
+                    required_status[file.name] = True
+                if file.name.startswith("公有数据看板-实时"):
+                    capacity_file_found = True
+
+        missing_files = [name for name, found in required_status.items() if not found]
+        if not capacity_file_found:
+            missing_files.append(PUBLIC_REALTIME_CAPACITY_LABEL)
+        if missing_files:
+            st.warning(f"⚠️ 还缺少 {len(missing_files)} 个必需文件：")
+            for name in missing_files:
+                st.write(f"  - {name}")
+        elif boundary_files:
+            st.success("✅ 所有必需文件已上传！")
+
+        force_sync = st.checkbox("忽略缓存强制导入", value=False, key="boundary_force_sync")
+
+        run_clicked = st.button(
+            "🔄 保存文件并导入数据库",
+            type="primary",
+            key="boundary_process",
+            disabled=(len(missing_files) > 0),
+        )
+        merge_only_clicked = st.button(
+            "⚙️ 仅合并生成预处理结果 (不导入数据库)",
+            key="boundary_merge_only",
+            disabled=(len(missing_files) > 0),
+        )
+
+        if run_clicked or merge_only_clicked:
+            if not boundary_files:
+                boundary_error = "请先上传 10 个必需文件后再处理"
+            else:
+                try:
+                    _persist_uploaded_files(boundary_files, margin_dir)
+                    spinner_msg = (
+                        "正在运行预处理脚本并写入数据库..."
+                        if run_clicked
+                        else "正在运行预处理脚本..."
+                    )
+                    with st.spinner(spinner_msg):
+                        preview_df = preprocess_data(data_dir=margin_dir, verbose=False)
+                        sync_result = None
+                        if run_clicked:
+                            sync_result = preprocess_dataset_and_sync(
+                                force=force_sync,
+                                data_dir=margin_dir,
+                                source_label="multi_file_bundle",
+                            )
+
+                    st.session_state["boundary_result"] = preview_df
+                    st.session_state["boundary_filename"] = "预处理结果_新版.xlsx"
+                    if run_clicked and sync_result is not None:
+                        boundary_success = f"{sync_result['status']}，导入 {sync_result['rows']:,} 行数据"
+                    else:
+                        boundary_success = f"合并完成，共 {len(preview_df):,} 行数据，可直接下载"
+                except Exception as exc:
+                    boundary_error = str(exc)
+
+    else:
+        st.markdown("### 📥 上传模板 (0市场边际数据库.xlsx)")
+        template_file = st.file_uploader(
+            "选择模板 Excel",
+            type=["xlsx"],
+            accept_multiple_files=False,
+            key="template_file_uploader",
+        )
+        force_sync_template = st.checkbox("忽略缓存强制导入", value=False, key="template_force_sync")
+        template_import = st.button(
+            "🔄 导入模板到数据库",
+            type="primary",
+            key="template_import",
+            disabled=template_file is None,
+        )
+        template_merge = st.button(
+            "⚙️ 仅合并模板 (不导入数据库)",
+            key="template_merge",
+            disabled=template_file is None,
+        )
+
+        if template_import or template_merge:
+            if not template_file:
+                boundary_error = "请先上传模板文件"
+            else:
+                try:
+                    _persist_uploaded_files([template_file], margin_dir)
+                    template_path = margin_dir / template_file.name
+                    spinner_msg = (
+                        "正在处理模板并写入数据库..."
+                        if template_import
+                        else "正在处理模板..."
+                    )
+                    with st.spinner(spinner_msg):
+                        template_df = preprocess_template_file(template_path, verbose=False)
+                        sync_result = None
+                        if template_import:
+                            sync_result = preprocess_dataset_and_sync(
+                                force=force_sync_template,
+                                preprocessed_df=template_df,
+                                source_label="template_file",
+                            )
+
+                    st.session_state["boundary_result"] = template_df
+                    st.session_state["boundary_filename"] = template_file.name or "预处理结果_新版.xlsx"
+                    if template_import and sync_result is not None:
+                        boundary_success = f"{sync_result['status']}，导入 {sync_result['rows']:,} 行数据"
+                    else:
+                        boundary_success = f"模板合并完成，共 {len(template_df):,} 行，可直接下载"
+                except Exception as exc:
+                    boundary_error = str(exc)
+
+    if boundary_success:
+        st.success(boundary_success)
+    if boundary_error:
+        st.error(boundary_error)
+
+    if "boundary_result" in st.session_state:
+        result_df = st.session_state["boundary_result"]
+        st.markdown("### 📊 处理结果统计")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("总行数", len(result_df))
+        col2.metric(
+            "日前数据行数",
+            len(result_df[result_df["边界数据类型"] == "日前"]),
+        )
+        col3.metric(
+            "实时数据行数",
+            len(result_df[result_df["边界数据类型"] == "实时"]),
+        )
+
+        if "在线机组容量(MW)" in result_df.columns:
+            online_capacity = result_df["在线机组容量(MW)"].dropna()
+            cap_val = (
+                online_capacity.iloc[0]
+                if not online_capacity.empty
+                else "未找到"
+            )
+            st.info(f"💡 提取到在线机组容量: {cap_val}")
+
+        st.markdown("### 👀 数据预览")
+        st.dataframe(result_df.head(30), use_container_width=True)
+
+        st.markdown("### 📥 下载预处理结果")
+        excel_data = _df_to_excel_bytes(result_df, sheet_name="预处理数据")
+        st.download_button(
+            label="📥 下载预处理后的Excel文件",
+            data=excel_data,
+            file_name=st.session_state.get("boundary_filename", "预处理结果_新版.xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    st.markdown("---")
+    st.markdown("### 数据库状态")
+    dataset_status = get_dataset_status()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("状态", dataset_status["state_label"], dataset_status.get("status_reason") or "")
+    c2.metric("数据库行数", f"{dataset_status['row_count']:,}")
+    c3.metric("上次同步", dataset_status.get("last_sync_time") or "—")
+    st.caption(
+        f"可用数据区间：{dataset_status.get('date_min') or '—'} 至"
+        f" {dataset_status.get('date_max') or '—'}"
+    )
+    if dataset_status.get("data_dir"):
+        st.caption(f"最近导入目录：{dataset_status['data_dir']}")
+    if dataset_status.get("raw_row_count") is not None:
+        st.caption(f"原始表条目：{dataset_status['raw_row_count']:,}")
+
+    st.caption("💡 提示：上传的文件仅用于当前会话，不会被永久保存。")
 
 
 # ----------------------------------------
 # 1) 模型管理
 # ----------------------------------------
-if MENU == "模型管理":
+elif MENU == "模型管理":
     st.subheader("模型数据库")
     all_models = list_models()
     if not all_models:
@@ -160,36 +427,20 @@ if MENU == "模型管理":
 # 2) 模型训练
 # ----------------------------------------
 elif MENU == "模型训练":
-    st.subheader("数据源管理")
+    st.subheader("数据源概览")
     dataset_status = get_dataset_status()
-    cfg = load_dataset_config()
-
-    with st.form("dataset_config_form"):
-        cols = st.columns([3, 1])
-        excel_path = cols[0].text_input("市场边际 Excel 路径", value=cfg.get("excel_path", ""))
-        sheet_name = cols[1].text_input("工作表名称(可选)", value=cfg.get("sheet_name", ""))
-        if st.form_submit_button("保存配置"):
-            cfg = update_dataset_config({"excel_path": excel_path, "sheet_name": sheet_name})
-            dataset_status = get_dataset_status()
-            st.success("配置已保存")
-
-    force_sync = st.checkbox("忽略缓存强制刷新", value=False)
-    if st.button("刷新数据库", type="primary"):
-        try:
-            result = sync_dataset_from_excel(force=force_sync)
-            dataset_status = get_dataset_status()
-            st.success(f"已导入 {result['rows']:,} 行数据")
-        except Exception as e:
-            st.error(f"刷新失败：{e}")
 
     c1, c2, c3 = st.columns(3)
     c1.metric("状态", dataset_status["state_label"], dataset_status.get("status_reason") or "")
     c2.metric("数据库行数", f"{dataset_status['row_count']:,}")
     c3.metric("上次同步", dataset_status.get("last_sync_time") or "—")
-    if dataset_status.get("excel_path"):
-        st.caption(f"Excel: {dataset_status['excel_path']}")
-    if dataset_status.get("excel_mtime_human"):
-        st.caption(f"Excel 修改时间: {dataset_status['excel_mtime_human']}")
+    st.caption(
+        f"数据区间：{dataset_status.get('date_min') or '—'} 至"
+        f" {dataset_status.get('date_max') or '—'}"
+    )
+    if dataset_status.get("data_dir"):
+        st.caption(f"最近使用的数据目录：{dataset_status['data_dir']}")
+    st.info("若需刷新数据库，请前往“数据预处理”页运行脚本。")
 
     st.markdown("---")
     st.subheader("模型训练")
@@ -203,7 +454,7 @@ elif MENU == "模型训练":
         upload_file = st.file_uploader("上传训练数据 Excel/CSV", type=["xlsx", "csv"])
     else:
         if dataset_status["row_count"] == 0:
-            st.info("数据库为空，请先完成 Excel 导入。")
+            st.info("数据库为空，请先到“数据预处理”页导入数据。")
         min_date = _parse_date(dataset_status.get("date_min"))
         max_date = _parse_date(dataset_status.get("date_max"))
         today = date.today()

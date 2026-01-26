@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 
 from pathlib import Path
-from typing import Tuple, Optional, List, Dict, Any
+from typing import Tuple, Optional, List, Dict, Any, Union
 
 import hashlib
 import json
@@ -20,19 +20,34 @@ import pwlf
 DATA_PATH = Path("data/marginal.csv")
 MODEL_PATH = Path("models/2025_marginal.pkl")
 DATA_DB_PATH = Path("data/marginal.sqlite")
-CONFIG_PATH = Path("data/dataset_config.json")
 DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
 MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
 DATA_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 MODELS_DIR = Path("models")
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 SH_TZ = ZoneInfo("Asia/Shanghai")
 
-DEFAULT_DATASET_CONFIG: Dict[str, Any] = {
-    "excel_path": "",
-    "sheet_name": "",
-}
+DB_COL_DATE = "日期"
+DB_COL_TIME = "时点"
+DB_COL_PRICE = "日前出清价格(元/MWh)"
+DB_COL_LOAD_RATE = "负荷率(%)"
+RAW_DB_COLUMNS = [
+    DB_COL_DATE,
+    DB_COL_TIME,
+    "边界数据类型",
+    "竞价空间(MW)",
+    "省调负荷(MW)",
+    "风电(MW)",
+    "光伏(MW)",
+    "新能源负荷(MW)",
+    "非市场化出力(MW)",
+    "水电出力(MW)",
+    "联络线计划(MW)",
+    "在线机组容量(MW)",
+    DB_COL_PRICE,
+    "实时出清价格(元/MWh)",
+    DB_COL_LOAD_RATE,
+]
 
 HEADER_HINTS = {
     "日期",
@@ -321,32 +336,6 @@ def predict_price(model: pwlf.PiecewiseLinFit, x: np.ndarray) -> np.ndarray:
 # Dataset configuration & Excel → SQLite sync helpers
 # -------------------------------------------------
 
-def load_dataset_config() -> Dict[str, Any]:
-    cfg = DEFAULT_DATASET_CONFIG.copy()
-    if CONFIG_PATH.exists():
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                user_cfg = json.load(f)
-            if isinstance(user_cfg, dict):
-                for key in DEFAULT_DATASET_CONFIG.keys():
-                    if key in user_cfg and user_cfg[key] is not None:
-                        cfg[key] = str(user_cfg[key]).strip()
-        except Exception:
-            # Ignore config parse errors; fall back to defaults
-            pass
-    return cfg
-
-
-def update_dataset_config(updates: Dict[str, Any]) -> Dict[str, Any]:
-    cfg = load_dataset_config()
-    for key, default_val in DEFAULT_DATASET_CONFIG.items():
-        if key in updates:
-            val = updates[key]
-            cfg[key] = str(val).strip() if val is not None else default_val
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-    return cfg
-
 
 def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DATA_DB_PATH)
@@ -358,11 +347,11 @@ def _ensure_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS marginal_data (
-            date TEXT NOT NULL,
-            time_slot TEXT NOT NULL,
-            price REAL NOT NULL,
-            load_rate REAL NOT NULL,
-            PRIMARY KEY (date, time_slot)
+            "日期" TEXT NOT NULL,
+            "时点" TEXT NOT NULL,
+            "日前出清价格(元/MWh)" REAL NOT NULL,
+            "负荷率(%)" REAL NOT NULL,
+            PRIMARY KEY ("日期", "时点")
         )
         """
     )
@@ -377,23 +366,23 @@ def _ensure_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS raw_marginal_data (
-            date TEXT,
-            time_slot TEXT,
-            boundary_type TEXT,
-            bidding_space_mw REAL,
-            dispatch_load_mw REAL,
-            wind_mw REAL,
-            solar_mw REAL,
-            new_energy_mw REAL,
-            non_market_output_mw REAL,
-            hydro_mw REAL,
-            tie_line_plan_mw REAL,
-            online_capacity_mw REAL,
-            day_ahead_price REAL,
-            real_time_price REAL,
-            load_rate_pct REAL,
+            "日期" TEXT,
+            "时点" TEXT,
+            "边界数据类型" TEXT,
+            "竞价空间(MW)" REAL,
+            "省调负荷(MW)" REAL,
+            "风电(MW)" REAL,
+            "光伏(MW)" REAL,
+            "新能源负荷(MW)" REAL,
+            "非市场化出力(MW)" REAL,
+            "水电出力(MW)" REAL,
+            "联络线计划(MW)" REAL,
+            "在线机组容量(MW)" REAL,
+            "日前出清价格(元/MWh)" REAL,
+            "实时出清价格(元/MWh)" REAL,
+            "负荷率(%)" REAL,
             extras_json TEXT,
-            PRIMARY KEY (date, time_slot, boundary_type)
+            PRIMARY KEY ("日期", "时点", "边界数据类型")
         )
         """
     )
@@ -429,7 +418,7 @@ def _count_raw_rows(conn: sqlite3.Connection) -> int:
 
 
 def _get_date_span(conn: sqlite3.Connection) -> Tuple[Optional[str], Optional[str]]:
-    cur = conn.execute("SELECT MIN(date), MAX(date) FROM marginal_data")
+    cur = conn.execute(f"SELECT MIN(\"{DB_COL_DATE}\"), MAX(\"{DB_COL_DATE}\") FROM marginal_data")
     row = cur.fetchone()
     return row[0], row[1]
 
@@ -475,24 +464,6 @@ def _normalize_date(val: Optional[Any]) -> Optional[str]:
     return str(val)
 
 
-def _load_source_frame(path: Path, sheet_name: Optional[str]) -> pd.DataFrame:
-    suffix = path.suffix.lower()
-    if suffix in {".xlsx", ".xls"}:
-        read_kwargs: Dict[str, Any] = {}
-        if sheet_name:
-            read_kwargs["sheet_name"] = sheet_name
-        df = pd.read_excel(path, **read_kwargs)
-        if _has_header_tokens(df.columns.tolist()):
-            return df
-        read_kwargs["header"] = None
-        return pd.read_excel(path, **read_kwargs)
-    if suffix in {".csv", ".txt"}:
-        df = pd.read_csv(path)
-        if _has_header_tokens(df.columns.tolist()):
-            return df
-        return pd.read_csv(path, header=None)
-    raise ValueError(f"不支持的文件类型: {path.suffix}")
-
 
 def _calc_dataframe_hash(df: pd.DataFrame) -> str:
     subset = df[["date", "time_slot", "price", "load_rate"]]
@@ -528,20 +499,34 @@ def _replace_raw_table(conn: sqlite3.Connection, df: pd.DataFrame, extras_cols: 
                 if pd.notna(value):
                     extras_payload[col] = _to_json_safe(value)
         extras_json = json.dumps(extras_payload, ensure_ascii=False) if extras_payload else None
-        row_values = [record.get(col) for col in RAW_TABLE_CORE_COLUMNS]
-        if row_values:
-            boundary_idx = RAW_TABLE_CORE_COLUMNS.index('boundary_type')
-            if row_values[boundary_idx] is None:
-                row_values[boundary_idx] = ''
-        rows.append(tuple(row_values + [extras_json]))
+        rows.append(
+            (
+                record.get('date'),
+                record.get('time_slot'),
+                record.get('boundary_type') or '',
+                record.get('bidding_space_mw'),
+                record.get('dispatch_load_mw'),
+                record.get('wind_mw'),
+                record.get('solar_mw'),
+                record.get('new_energy_mw'),
+                record.get('non_market_output_mw'),
+                record.get('hydro_mw'),
+                record.get('tie_line_plan_mw'),
+                record.get('online_capacity_mw'),
+                record.get('day_ahead_price'),
+                record.get('real_time_price'),
+                record.get('load_rate_pct'),
+                extras_json,
+            )
+        )
     conn.execute("DELETE FROM raw_marginal_data")
     conn.executemany(
         """
         INSERT INTO raw_marginal_data (
-            date, time_slot, boundary_type, bidding_space_mw, dispatch_load_mw,
-            wind_mw, solar_mw, new_energy_mw, non_market_output_mw, hydro_mw,
-            tie_line_plan_mw, online_capacity_mw, day_ahead_price, real_time_price,
-            load_rate_pct, extras_json
+            "日期", "时点", "边界数据类型", "竞价空间(MW)", "省调负荷(MW)",
+            "风电(MW)", "光伏(MW)", "新能源负荷(MW)", "非市场化出力(MW)", "水电出力(MW)",
+            "联络线计划(MW)", "在线机组容量(MW)", "日前出清价格(元/MWh)", "实时出清价格(元/MWh)",
+            "负荷率(%)", extras_json
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
@@ -549,13 +534,6 @@ def _replace_raw_table(conn: sqlite3.Connection, df: pd.DataFrame, extras_cols: 
 
 
 def get_dataset_status() -> Dict[str, Any]:
-    cfg = load_dataset_config()
-    configured_path = cfg.get("excel_path", "").strip()
-    configured_sheet = cfg.get("sheet_name", "").strip()
-    excel_path = Path(configured_path).expanduser() if configured_path else None
-    excel_exists = excel_path.exists() if excel_path else False
-    excel_mtime = excel_path.stat().st_mtime if excel_exists else None
-
     with _get_conn() as conn:
         _ensure_db(conn)
         row_count = _count_rows(conn)
@@ -566,23 +544,13 @@ def get_dataset_status() -> Dict[str, Any]:
     last_hash = meta.get("last_hash") if meta else None
     meta_row_count = meta.get("last_row_count") if meta else None
     last_row_count = int(meta_row_count) if meta_row_count else row_count
-    meta_excel_mtime = meta.get("last_excel_mtime") if meta else None
-    recorded_mtime = float(meta_excel_mtime) if meta_excel_mtime else None
+    data_dir = meta.get("last_data_dir") if meta else None
+    data_source = meta.get("last_data_source") if meta else None
+    raw_rows_meta = meta.get("last_raw_row_count") if meta else None
+    raw_row_count = int(raw_rows_meta) if raw_rows_meta else None
 
-    needs_sync = False
-    reason = None
-    if not configured_path:
-        needs_sync = True
-        reason = "未配置 Excel 路径"
-    elif not excel_exists:
-        needs_sync = True
-        reason = "Excel 文件不存在"
-    elif row_count == 0:
-        needs_sync = True
-        reason = "数据库为空"
-    elif excel_mtime and recorded_mtime and excel_mtime > recorded_mtime + 1e-6:
-        needs_sync = True
-        reason = "Excel 文件有更新"
+    needs_sync = row_count == 0
+    reason = "数据库为空，请先运行数据预处理" if needs_sync else None
 
     return {
         "row_count": row_count,
@@ -591,36 +559,50 @@ def get_dataset_status() -> Dict[str, Any]:
         "last_sync_time": last_sync,
         "last_hash": last_hash,
         "last_row_count": last_row_count,
-        "excel_path": configured_path,
-        "sheet_name": configured_sheet,
-        "excel_exists": excel_exists,
-        "excel_mtime": excel_mtime,
-        "excel_mtime_human": _format_epoch(excel_mtime) if excel_mtime else None,
         "needs_sync": needs_sync,
         "status_reason": reason,
-        "state_label": "待同步" if needs_sync else "已同步",
+        "state_label": "未导入" if needs_sync else "已同步",
+        "data_dir": data_dir,
+        "data_source": data_source,
+        "raw_row_count": raw_row_count,
     }
 
 
-def sync_dataset_from_excel(force: bool = False) -> Dict[str, Any]:
-    cfg = load_dataset_config()
-    path_str = cfg.get("excel_path", "").strip()
-    if not path_str:
-        raise ValueError("请先在配置中设置 Excel 文件路径")
-    source_path = Path(path_str).expanduser()
-    if not source_path.exists():
-        raise FileNotFoundError(f"Excel 文件不存在: {source_path}")
-    sheet_name = cfg.get("sheet_name", "").strip() or None
+def preprocess_dataset_and_sync(
+    force: bool = False,
+    data_dir: Optional[Union[str, Path]] = None,
+    preprocessed_df: Optional[pd.DataFrame] = None,
+    source_label: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run scripts.pre_process (or use provided df) and persist the result into SQLite."""
 
-    raw_df = _load_source_frame(source_path, sheet_name)
+    from scripts.pre_process import preprocess_data
+
+    if preprocessed_df is not None:
+        raw_df = preprocessed_df.copy()
+        base_dir = Path(data_dir) if data_dir else Path("margin_data")
+    else:
+        base_dir = Path(data_dir) if data_dir else Path("margin_data")
+        raw_df = preprocess_data(data_dir=base_dir, verbose=False)
+    if raw_df is None:
+        raise ValueError("预处理数据为空")
+    if raw_df.empty:
+        raise ValueError("预处理结果为空，无法导入")
+
+    raw_df = raw_df.reset_index(drop=True)
     raw_prepared, raw_extra_cols = _prepare_raw_dataframe(raw_df.copy())
+
     cleaned = clean_marginal_data(raw_df.copy())
     cleaned = cleaned.sort_values(["date", "time_slot"]).reset_index(drop=True)
     if cleaned.empty:
         raise ValueError("清洗后的数据为空，无法导入")
 
     fingerprint = _calc_dataframe_hash(cleaned)
-    excel_mtime = source_path.stat().st_mtime
+    if source_label:
+        source_dir = source_label
+    else:
+        source_dir = str(base_dir.resolve()) if base_dir.exists() else str(base_dir)
+    source_type = source_label or ("preprocess_script" if preprocessed_df is None else "preprocessed_dataframe")
 
     with _get_conn() as conn:
         _ensure_db(conn)
@@ -644,11 +626,13 @@ def sync_dataset_from_excel(force: bool = False) -> Dict[str, Any]:
                 "rows": previous_rows,
                 "hash": fingerprint,
                 "last_sync_time": meta.get("last_sync_time") if meta else None,
+                "data_dir": source_dir,
             }
 
         conn.execute("DELETE FROM marginal_data")
         conn.executemany(
-            "INSERT INTO marginal_data(date, time_slot, price, load_rate) VALUES (?, ?, ?, ?)",
+            f"INSERT INTO marginal_data(\"{DB_COL_DATE}\", \"{DB_COL_TIME}\", \"{DB_COL_PRICE}\", \"{DB_COL_LOAD_RATE}\")"
+            " VALUES (?, ?, ?, ?)",
             cleaned[["date", "time_slot", "price", "load_rate"]].itertuples(index=False, name=None),
         )
         _replace_raw_table(conn, raw_prepared, raw_extra_cols)
@@ -659,12 +643,11 @@ def sync_dataset_from_excel(force: bool = False) -> Dict[str, Any]:
             {
                 "last_sync_time": now_iso,
                 "last_hash": fingerprint,
-                "last_excel_path": str(source_path),
-                "last_excel_mtime": excel_mtime,
                 "last_row_count": len(cleaned),
-                "last_sheet_name": sheet_name or "",
                 "raw_table_ready": "1",
                 "last_raw_row_count": len(raw_prepared),
+                "last_data_dir": source_dir,
+                "last_data_source": source_type,
             },
         )
 
@@ -675,8 +658,7 @@ def sync_dataset_from_excel(force: bool = False) -> Dict[str, Any]:
         "rows": len(cleaned),
         "hash": fingerprint,
         "last_sync_time": now_iso,
-        "excel_path": str(source_path),
-        "sheet_name": sheet_name,
+        "data_dir": source_dir,
     }
 
 
@@ -685,13 +667,17 @@ def fetch_dataset(date_start: Optional[Any] = None, date_end: Optional[Any] = No
     end = _normalize_date(date_end)
     with _get_conn() as conn:
         _ensure_db(conn)
-        query = "SELECT date, time_slot, price, load_rate FROM marginal_data WHERE 1=1"
+        query = (
+            f'SELECT "{DB_COL_DATE}" AS date, "{DB_COL_TIME}" AS time_slot, '
+            f'"{DB_COL_PRICE}" AS price, "{DB_COL_LOAD_RATE}" AS load_rate '
+            f"FROM marginal_data WHERE 1=1"
+        )
         params: List[Any] = []
         if start:
-            query += " AND date >= ?"
+            query += f' AND "{DB_COL_DATE}" >= ?'
             params.append(start)
         if end:
-            query += " AND date <= ?"
+            query += f' AND "{DB_COL_DATE}" <= ?'
             params.append(end)
         query += " ORDER BY date, time_slot"
         df = pd.read_sql_query(query, conn, params=params)
