@@ -519,7 +519,17 @@ def _replace_raw_table(conn: sqlite3.Connection, df: pd.DataFrame, extras_cols: 
                 extras_json,
             )
         )
-    conn.execute("DELETE FROM raw_marginal_data")
+    # 增量更新原始数据表：只删除新数据涉及的日期范围
+    if rows:
+        # 获取新数据的日期范围
+        new_dates = list(set(row[0] for row in rows if row[0] is not None))
+        if new_dates:
+            date_placeholders = ",".join("?" * len(new_dates))
+            conn.execute(
+                f"DELETE FROM raw_marginal_data WHERE \"日期\" IN ({date_placeholders})",
+                new_dates
+            )
+
     conn.executemany(
         """
         INSERT INTO raw_marginal_data (
@@ -629,13 +639,29 @@ def preprocess_dataset_and_sync(
                 "data_dir": source_dir,
             }
 
-        conn.execute("DELETE FROM marginal_data")
-        conn.executemany(
-            f"INSERT INTO marginal_data(\"{DB_COL_DATE}\", \"{DB_COL_TIME}\", \"{DB_COL_PRICE}\", \"{DB_COL_LOAD_RATE}\")"
-            " VALUES (?, ?, ?, ?)",
-            cleaned[["date", "time_slot", "price", "load_rate"]].itertuples(index=False, name=None),
-        )
+        # 增量更新：只删除新数据涉及的日期范围，避免清空整个数据库
+        if not cleaned.empty:
+            # 获取新数据的日期范围
+            new_dates = cleaned["date"].unique()
+            date_placeholders = ",".join("?" * len(new_dates))
+
+            # 只删除新数据涉及日期的记录，实现增量更新
+            conn.execute(
+                f"DELETE FROM marginal_data WHERE \"{DB_COL_DATE}\" IN ({date_placeholders})",
+                new_dates.tolist()
+            )
+
+            # 插入新数据
+            conn.executemany(
+                f"INSERT INTO marginal_data(\"{DB_COL_DATE}\", \"{DB_COL_TIME}\", \"{DB_COL_PRICE}\", \"{DB_COL_LOAD_RATE}\")"
+                " VALUES (?, ?, ?, ?)",
+                cleaned[["date", "time_slot", "price", "load_rate"]].itertuples(index=False, name=None),
+            )
         _replace_raw_table(conn, raw_prepared, raw_extra_cols)
+
+        # 重新计算数据库中的实际总行数（增量更新后）
+        actual_total_rows = _count_rows(conn)
+        actual_raw_rows = _count_raw_rows(conn)
 
         now_iso = _now_shanghai().strftime("%Y-%m-%d %H:%M:%S")
         _set_meta_bulk(
@@ -643,9 +669,9 @@ def preprocess_dataset_and_sync(
             {
                 "last_sync_time": now_iso,
                 "last_hash": fingerprint,
-                "last_row_count": len(cleaned),
+                "last_row_count": actual_total_rows,  # 使用实际总行数
                 "raw_table_ready": "1",
-                "last_raw_row_count": len(raw_prepared),
+                "last_raw_row_count": actual_raw_rows,  # 使用实际原始数据行数
                 "last_data_dir": source_dir,
                 "last_data_source": source_type,
             },
@@ -655,7 +681,7 @@ def preprocess_dataset_and_sync(
 
     return {
         "status": "updated",
-        "rows": len(cleaned),
+        "rows": actual_total_rows,  # 返回数据库中的实际总行数
         "hash": fingerprint,
         "last_sync_time": now_iso,
         "data_dir": source_dir,

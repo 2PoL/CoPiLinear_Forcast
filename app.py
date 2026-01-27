@@ -154,12 +154,20 @@ if MENU == "数据预处理":
         missing_files = [name for name, found in required_status.items() if not found]
         if not capacity_file_found:
             missing_files.append(PUBLIC_REALTIME_CAPACITY_LABEL)
-        if missing_files:
-            st.warning(f"⚠️ 还缺少 {len(missing_files)} 个必需文件：")
-            for name in missing_files:
-                st.write(f"  - {name}")
-        elif boundary_files:
-            st.success("✅ 所有必需文件已上传！")
+
+        # 显示文件状态信息
+        if boundary_files:
+            found_files = [name for name, found in required_status.items() if found]
+            if capacity_file_found:
+                found_files.append("公有数据看板-实时文件")
+
+            if missing_files:
+                st.info(f"📊 已上传 {len(found_files)} 个文件，还可选择上传 {len(missing_files)} 个文件：")
+                for name in missing_files:
+                    st.write(f"  - {name}")
+                st.caption("💡 提示：可以使用部分文件进行合并，系统会根据可用文件生成相应的数据。")
+            else:
+                st.success("✅ 所有推荐文件已上传！")
 
         force_sync = st.checkbox("忽略缓存强制导入", value=False, key="boundary_force_sync")
 
@@ -167,17 +175,17 @@ if MENU == "数据预处理":
             "🔄 保存文件并导入数据库",
             type="primary",
             key="boundary_process",
-            disabled=(len(missing_files) > 0),
+            disabled=(not boundary_files),  # 只要有文件就可以处理
         )
         merge_only_clicked = st.button(
             "⚙️ 仅合并生成预处理结果 (不导入数据库)",
             key="boundary_merge_only",
-            disabled=(len(missing_files) > 0),
+            disabled=(not boundary_files),  # 只要有文件就可以处理
         )
 
         if run_clicked or merge_only_clicked:
             if not boundary_files:
-                boundary_error = "请先上传 10 个必需文件后再处理"
+                boundary_error = "请先上传至少一个文件后再处理"
             else:
                 try:
                     _persist_uploaded_files(boundary_files, margin_dir)

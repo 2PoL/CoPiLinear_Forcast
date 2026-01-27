@@ -10,6 +10,30 @@ def _log(message: str, *, verbose: bool) -> None:
         print(message)
 
 
+def _safe_merge(left_df: pd.DataFrame, right_df: pd.DataFrame, on: list, how: str = 'outer') -> pd.DataFrame:
+    """安全地合并DataFrame，如果右侧DataFrame为空则返回左侧DataFrame"""
+    if right_df.empty:
+        return left_df
+    if left_df.empty:
+        return right_df
+    return pd.merge(left_df, right_df, on=on, how=how)
+
+
+def _safe_read_excel(file_path: Path, description: str, *, verbose: bool = False) -> pd.DataFrame:
+    """安全地读取Excel文件，如果文件不存在则返回空DataFrame"""
+    if not file_path.exists():
+        _log(f"  ⚠️ 文件不存在，跳过: {file_path.name}", verbose=verbose)
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_excel(file_path, header=0)
+        _log(f"  ✅ 成功读取: {file_path.name} ({len(df)} 行)", verbose=verbose)
+        return df
+    except Exception as e:
+        _log(f"  ❌ 读取失败: {file_path.name} - {str(e)}", verbose=verbose)
+        return pd.DataFrame()
+
+
 def extract_online_capacity(text):
     """从出清概况中提取在线机组容量"""
     if pd.isna(text):
@@ -82,117 +106,142 @@ def preprocess_data(data_dir: Union[str, Path] = "margin_data", *, verbose: bool
 
     # 1. 读取日前统调系统负荷预测_REPORT0 - D列 -> 省调负荷(MW) E列
     _log("处理日前统调系统负荷预测...", verbose=verbose)
-    df_load = pd.read_excel(data_dir / "日前统调系统负荷预测_REPORT0.xlsx", header=0)
-    # 从第2行开始读取数据（跳过表头行）
-    df_load = df_load.iloc[1:].reset_index(drop=True)
-    df_load['日期'] = pd.to_datetime(df_load.iloc[:, 1]).dt.date
-    df_load['时点'] = df_load.iloc[:, 2].astype(str)
-    df_load['省调负荷(MW)'] = pd.to_numeric(df_load.iloc[:, 3], errors='coerce')
+    df_load_raw = _safe_read_excel(data_dir / "日前统调系统负荷预测_REPORT0.xlsx", "日前统调系统负荷预测", verbose=verbose)
+    df_load = pd.DataFrame()
+    if not df_load_raw.empty:
+        # 从第2行开始读取数据（跳过表头行）
+        df_load = df_load_raw.iloc[1:].reset_index(drop=True)
+        df_load['日期'] = pd.to_datetime(df_load.iloc[:, 1]).dt.date
+        df_load['时点'] = df_load.iloc[:, 2].astype(str)
+        df_load['省调负荷(MW)'] = pd.to_numeric(df_load.iloc[:, 3], errors='coerce')
 
     # 2. 读取日前新能源负荷预测_REPORT0 - E,F列 -> F,G列, D列 -> H列
     _log("处理日前新能源负荷预测...", verbose=verbose)
-    df_renewable = pd.read_excel(data_dir / "日前新能源负荷预测_REPORT0.xlsx", header=0)
-    df_renewable = df_renewable.iloc[1:].reset_index(drop=True)
-    df_renewable['日期'] = pd.to_datetime(df_renewable.iloc[:, 1]).dt.date
-    df_renewable['时点'] = df_renewable.iloc[:, 2].astype(str)
-    df_renewable['风电(MW)'] = pd.to_numeric(df_renewable.iloc[:, 4], errors='coerce')
-    df_renewable['光伏(MW)'] = pd.to_numeric(df_renewable.iloc[:, 5], errors='coerce')
-    df_renewable['新能源负荷(MW)'] = pd.to_numeric(df_renewable.iloc[:, 3], errors='coerce')
+    df_renewable_raw = _safe_read_excel(data_dir / "日前新能源负荷预测_REPORT0.xlsx", "日前新能源负荷预测", verbose=verbose)
+    df_renewable = pd.DataFrame()
+    if not df_renewable_raw.empty:
+        df_renewable = df_renewable_raw.iloc[1:].reset_index(drop=True)
+        df_renewable['日期'] = pd.to_datetime(df_renewable.iloc[:, 1]).dt.date
+        df_renewable['时点'] = df_renewable.iloc[:, 2].astype(str)
+        df_renewable['风电(MW)'] = pd.to_numeric(df_renewable.iloc[:, 4], errors='coerce')
+        df_renewable['光伏(MW)'] = pd.to_numeric(df_renewable.iloc[:, 5], errors='coerce')
+        df_renewable['新能源负荷(MW)'] = pd.to_numeric(df_renewable.iloc[:, 3], errors='coerce')
 
     # 3. 读取披露信息96点数据_REPORT0 - D列 -> 非市场化出力(MW) I列
     _log("处理披露信息96点数据...", verbose=verbose)
-    df_disclosure = pd.read_excel(data_dir / "披露信息96点数据_REPORT0.xlsx", header=0)
-    df_disclosure = df_disclosure.iloc[1:].reset_index(drop=True)
-    df_disclosure['日期'] = pd.to_datetime(df_disclosure.iloc[:, 1]).dt.date
-    df_disclosure['时点'] = df_disclosure.iloc[:, 2].astype(str)
-    df_disclosure['非市场化出力(MW)'] = pd.to_numeric(df_disclosure.iloc[:, 3], errors='coerce')
+    df_disclosure_raw = _safe_read_excel(data_dir / "披露信息96点数据_REPORT0.xlsx", "披露信息96点数据", verbose=verbose)
+    df_disclosure = pd.DataFrame()
+    if not df_disclosure_raw.empty:
+        df_disclosure = df_disclosure_raw.iloc[1:].reset_index(drop=True)
+        df_disclosure['日期'] = pd.to_datetime(df_disclosure.iloc[:, 1]).dt.date
+        df_disclosure['时点'] = df_disclosure.iloc[:, 2].astype(str)
+        df_disclosure['非市场化出力(MW)'] = pd.to_numeric(df_disclosure.iloc[:, 3], errors='coerce')
 
     # 4. 读取日前联络线计划_REPORT0 - E列 -> 联络线计划(MW) K列
     _log("处理日前联络线计划...", verbose=verbose)
-    df_tie_line = pd.read_excel(data_dir / "日前联络线计划_REPORT0.xlsx", header=0)
-    df_tie_line = df_tie_line.iloc[1:].reset_index(drop=True)
-    df_tie_line = df_tie_line[df_tie_line.iloc[:, 1] == '总加']  # 只取总加行
-    df_tie_line['日期'] = pd.to_datetime(df_tie_line.iloc[:, 2]).dt.date
-    df_tie_line['时点'] = df_tie_line.iloc[:, 3].astype(str)
-    df_tie_line['联络线计划(MW)'] = pd.to_numeric(df_tie_line.iloc[:, 4], errors='coerce')
+    df_tie_line_raw = _safe_read_excel(data_dir / "日前联络线计划_REPORT0.xlsx", "日前联络线计划", verbose=verbose)
+    df_tie_line = pd.DataFrame()
+    if not df_tie_line_raw.empty:
+        df_tie_line = df_tie_line_raw.iloc[1:].reset_index(drop=True)
+        df_tie_line = df_tie_line[df_tie_line.iloc[:, 1] == '总加']  # 只取总加行
+        df_tie_line['日期'] = pd.to_datetime(df_tie_line.iloc[:, 2]).dt.date
+        df_tie_line['时点'] = df_tie_line.iloc[:, 3].astype(str)
+        df_tie_line['联络线计划(MW)'] = pd.to_numeric(df_tie_line.iloc[:, 4], errors='coerce')
 
     # 5. 读取日前市场出清情况_TABLE - 提取在线机组容量 -> L列
     _log("处理日前市场出清情况...", verbose=verbose)
-    df_clearing = pd.read_excel(data_dir / "日前市场出清情况_TABLE.xlsx", header=0)
-    df_clearing = df_clearing.iloc[1:].reset_index(drop=True)
-    # 提取在线机组容量（只有一个值，应用到所有行）
-    online_capacity = extract_online_capacity(df_clearing.iloc[0, 2])
-    _log(f"  提取到在线机组容量: {online_capacity} MW", verbose=verbose)
+    df_clearing_raw = _safe_read_excel(data_dir / "日前市场出清情况_TABLE.xlsx", "日前市场出清情况", verbose=verbose)
+    online_capacity = None
+    if not df_clearing_raw.empty:
+        df_clearing = df_clearing_raw.iloc[1:].reset_index(drop=True)
+        # 提取在线机组容量（只有一个值，应用到所有行）
+        online_capacity = extract_online_capacity(df_clearing.iloc[0, 2])
+        _log(f"  提取到在线机组容量: {online_capacity} MW", verbose=verbose)
 
     # 7. 读取日前水电计划发电总出力预测_REPORT0 - D列 -> 水电出力(MW) J列
     _log("处理日前水电计划...", verbose=verbose)
-    df_hydro = pd.read_excel(data_dir / "日前水电计划发电总出力预测_REPORT0.xlsx", header=0)
-    df_hydro = df_hydro.iloc[1:].reset_index(drop=True)
-    df_hydro['日期'] = pd.to_datetime(df_hydro.iloc[:, 1]).dt.date
-    df_hydro['时点'] = df_hydro.iloc[:, 2].astype(str)
-    df_hydro['水电出力(MW)'] = pd.to_numeric(df_hydro.iloc[:, 3], errors='coerce')
+    df_hydro_raw = _safe_read_excel(data_dir / "日前水电计划发电总出力预测_REPORT0.xlsx", "日前水电计划", verbose=verbose)
+    df_hydro = pd.DataFrame()
+    if not df_hydro_raw.empty:
+        df_hydro = df_hydro_raw.iloc[1:].reset_index(drop=True)
+        df_hydro['日期'] = pd.to_datetime(df_hydro.iloc[:, 1]).dt.date
+        df_hydro['时点'] = df_hydro.iloc[:, 2].astype(str)
+        df_hydro['水电出力(MW)'] = pd.to_numeric(df_hydro.iloc[:, 3], errors='coerce')
 
     # 8. 读取96点电网运行实际值_REPORT0 - 实时数据
     _log("处理96点电网运行实际值...", verbose=verbose)
-    df_actual = pd.read_excel(data_dir / "96点电网运行实际值_REPORT0.xlsx", header=0)
-    df_actual = df_actual.iloc[1:].reset_index(drop=True)
-    df_actual['日期'] = pd.to_datetime(df_actual.iloc[:, 1]).dt.date
-    df_actual['时点'] = df_actual.iloc[:, 2].astype(str)
-    df_actual['省调负荷(MW)'] = pd.to_numeric(df_actual.iloc[:, 3], errors='coerce')
-    df_actual['风电(MW)'] = pd.to_numeric(df_actual.iloc[:, 5], errors='coerce')
-    df_actual['光伏(MW)'] = pd.to_numeric(df_actual.iloc[:, 6], errors='coerce')
-    df_actual['新能源负荷(MW)'] = pd.to_numeric(df_actual.iloc[:, 7], errors='coerce')
-    df_actual['水电出力(MW)'] = pd.to_numeric(df_actual.iloc[:, 8], errors='coerce')
-    df_actual['非市场化出力(MW)'] = pd.to_numeric(df_actual.iloc[:, 11], errors='coerce')
+    df_actual_raw = _safe_read_excel(data_dir / "96点电网运行实际值_REPORT0.xlsx", "96点电网运行实际值", verbose=verbose)
+    df_actual = pd.DataFrame()
+    if not df_actual_raw.empty:
+        df_actual = df_actual_raw.iloc[1:].reset_index(drop=True)
+        df_actual['日期'] = pd.to_datetime(df_actual.iloc[:, 1]).dt.date
+        df_actual['时点'] = df_actual.iloc[:, 2].astype(str)
+        df_actual['省调负荷(MW)'] = pd.to_numeric(df_actual.iloc[:, 3], errors='coerce')
+        df_actual['风电(MW)'] = pd.to_numeric(df_actual.iloc[:, 5], errors='coerce')
+        df_actual['光伏(MW)'] = pd.to_numeric(df_actual.iloc[:, 6], errors='coerce')
+        df_actual['新能源负荷(MW)'] = pd.to_numeric(df_actual.iloc[:, 7], errors='coerce')
+        df_actual['水电出力(MW)'] = pd.to_numeric(df_actual.iloc[:, 8], errors='coerce')
+        df_actual['非市场化出力(MW)'] = pd.to_numeric(df_actual.iloc[:, 11], errors='coerce')
 
     # 9. 读取实时联络线计划_REPORT0 - E列 -> 联络线计划(MW) K列（实时）
     _log("处理实时联络线计划...", verbose=verbose)
-    df_tie_line_rt = pd.read_excel(data_dir / "实时联络线计划_REPORT0.xlsx", header=0)
-    df_tie_line_rt = df_tie_line_rt.iloc[1:].reset_index(drop=True)
-    df_tie_line_rt = df_tie_line_rt[df_tie_line_rt.iloc[:, 1] == '总加']  # 只取总加行
-    df_tie_line_rt['日期'] = pd.to_datetime(df_tie_line_rt.iloc[:, 2]).dt.date
-    df_tie_line_rt['时点'] = df_tie_line_rt.iloc[:, 3].astype(str)
-    df_tie_line_rt['联络线计划(MW)'] = pd.to_numeric(df_tie_line_rt.iloc[:, 4], errors='coerce')
+    df_tie_line_rt_raw = _safe_read_excel(data_dir / "实时联络线计划_REPORT0.xlsx", "实时联络线计划", verbose=verbose)
+    df_tie_line_rt = pd.DataFrame()
+    if not df_tie_line_rt_raw.empty:
+        df_tie_line_rt = df_tie_line_rt_raw.iloc[1:].reset_index(drop=True)
+        df_tie_line_rt = df_tie_line_rt[df_tie_line_rt.iloc[:, 1] == '总加']  # 只取总加行
+        df_tie_line_rt['日期'] = pd.to_datetime(df_tie_line_rt.iloc[:, 2]).dt.date
+        df_tie_line_rt['时点'] = df_tie_line_rt.iloc[:, 3].astype(str)
+        df_tie_line_rt['联络线计划(MW)'] = pd.to_numeric(df_tie_line_rt.iloc[:, 4], errors='coerce')
 
     # 10. 读取现货出清电价_REPORT0 - 实时和日前出清价格
     _log("处理现货出清电价...", verbose=verbose)
-    df_price = pd.read_excel(data_dir / "现货出清电价_REPORT0.xlsx")
-    # 过滤掉均价汇总行（序号不是数字的行）
-    df_price = df_price[pd.to_numeric(df_price['序号'], errors='coerce').notna()]
-    df_price['日期'] = pd.to_datetime(df_price['日期']).dt.date
-    df_price['时点'] = df_price['时点'].astype(str)
-    df_price['实时出清价格(元/MWh)'] = pd.to_numeric(df_price['实时出清价格(元/MWh)'], errors='coerce')
-    df_price['日前出清价格(元/MWh)'] = pd.to_numeric(df_price['日前出清价格(元/MWh)'], errors='coerce')
+    df_price_raw = _safe_read_excel(data_dir / "现货出清电价_REPORT0.xlsx", "现货出清电价", verbose=verbose)
+    df_price = pd.DataFrame()
+    if not df_price_raw.empty:
+        # 过滤掉均价汇总行（序号不是数字的行）
+        df_price = df_price_raw[pd.to_numeric(df_price_raw['序号'], errors='coerce').notna()]
+        df_price['日期'] = pd.to_datetime(df_price['日期']).dt.date
+        df_price['时点'] = df_price['时点'].astype(str)
+        df_price['实时出清价格(元/MWh)'] = pd.to_numeric(df_price['实时出清价格(元/MWh)'], errors='coerce')
+        df_price['日前出清价格(元/MWh)'] = pd.to_numeric(df_price['日前出清价格(元/MWh)'], errors='coerce')
 
     # 合并所有日前数据
     _log("合并日前数据...", verbose=verbose)
-    day_ahead_data = pd.merge(
-        df_load[['日期', '时点', '省调负荷(MW)']],
-        df_renewable[['日期', '时点', '风电(MW)', '光伏(MW)', '新能源负荷(MW)']],
+    # 从第一个非空的DataFrame开始
+    day_ahead_data = pd.DataFrame()
+
+    # 安全合并各个数据源
+    if not df_load.empty:
+        day_ahead_data = df_load[['日期', '时点', '省调负荷(MW)']]
+
+    day_ahead_data = _safe_merge(
+        day_ahead_data,
+        df_renewable[['日期', '时点', '风电(MW)', '光伏(MW)', '新能源负荷(MW)']] if not df_renewable.empty else pd.DataFrame(),
         on=['日期', '时点'],
         how='outer'
     )
-    day_ahead_data = pd.merge(
+    day_ahead_data = _safe_merge(
         day_ahead_data,
-        df_disclosure[['日期', '时点', '非市场化出力(MW)']],
+        df_disclosure[['日期', '时点', '非市场化出力(MW)']] if not df_disclosure.empty else pd.DataFrame(),
         on=['日期', '时点'],
         how='outer'
     )
-    day_ahead_data = pd.merge(
+    day_ahead_data = _safe_merge(
         day_ahead_data,
-        df_tie_line[['日期', '时点', '联络线计划(MW)']],
+        df_tie_line[['日期', '时点', '联络线计划(MW)']] if not df_tie_line.empty else pd.DataFrame(),
         on=['日期', '时点'],
         how='outer'
     )
-    day_ahead_data = pd.merge(
+    day_ahead_data = _safe_merge(
         day_ahead_data,
-        df_hydro[['日期', '时点', '水电出力(MW)']],
+        df_hydro[['日期', '时点', '水电出力(MW)']] if not df_hydro.empty else pd.DataFrame(),
         on=['日期', '时点'],
         how='outer'
     )
-    day_ahead_data = pd.merge(
+    day_ahead_data = _safe_merge(
         day_ahead_data,
-        df_price[['日期', '时点', '日前出清价格(元/MWh)']],
+        df_price[['日期', '时点', '日前出清价格(元/MWh)']] if not df_price.empty else pd.DataFrame(),
         on=['日期', '时点'],
         how='outer'
     )
@@ -227,26 +276,29 @@ def preprocess_data(data_dir: Union[str, Path] = "margin_data", *, verbose: bool
 
     # 合并所有实时数据
     _log("合并实时数据...", verbose=verbose)
-    real_time_data = df_actual[['日期', '时点', '省调负荷(MW)', '风电(MW)', '光伏(MW)',
-                                  '新能源负荷(MW)', '水电出力(MW)', '非市场化出力(MW)']].copy()
-    real_time_data = pd.merge(
+    real_time_data = pd.DataFrame()
+    if not df_actual.empty:
+        real_time_data = df_actual[['日期', '时点', '省调负荷(MW)', '风电(MW)', '光伏(MW)',
+                                      '新能源负荷(MW)', '水电出力(MW)', '非市场化出力(MW)']].copy()
+
+    real_time_data = _safe_merge(
         real_time_data,
-        df_tie_line_rt[['日期', '时点', '联络线计划(MW)']],
+        df_tie_line_rt[['日期', '时点', '联络线计划(MW)']] if not df_tie_line_rt.empty else pd.DataFrame(),
         on=['日期', '时点'],
         how='left'
     )
-    real_time_data = pd.merge(
+    real_time_data = _safe_merge(
         real_time_data,
-        df_price[['日期', '时点', '实时出清价格(元/MWh)']],
+        df_price[['日期', '时点', '实时出清价格(元/MWh)']] if not df_price.empty else pd.DataFrame(),
         on=['日期', '时点'],
         how='left'
     )
     if real_time_capacity is not None:
-        real_time_data = pd.merge(
+        real_time_data = _safe_merge(
             real_time_data,
             real_time_capacity,
             on=['日期', '时点'],
-            how='left',
+            how='left'
         )
     if '在线机组容量(MW)' not in real_time_data.columns:
         real_time_data['在线机组容量(MW)'] = None
@@ -254,6 +306,12 @@ def preprocess_data(data_dir: Union[str, Path] = "margin_data", *, verbose: bool
 
     # 合并日前和实时数据
     _log("合并所有数据...", verbose=verbose)
+
+    # 检查是否有任何有效数据
+    if day_ahead_data.empty and real_time_data.empty:
+        _log("⚠️ 警告：没有找到任何有效的数据文件，返回空结果", verbose=verbose)
+        return _finalize_dataframe(pd.DataFrame())
+
     result_df = pd.concat([day_ahead_data, real_time_data], ignore_index=True)
     return _finalize_dataframe(result_df)
 
