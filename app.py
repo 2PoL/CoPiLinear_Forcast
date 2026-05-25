@@ -448,6 +448,13 @@ elif MENU == "模型训练":
     )
     if dataset_status.get("data_dir"):
         st.caption(f"最近使用的数据目录：{dataset_status['data_dir']}")
+    boundary_status = dataset_status.get("boundary_status") or {}
+    if boundary_status:
+        b1, b2 = st.columns(2)
+        day_status = boundary_status.get("日前", {})
+        rt_status = boundary_status.get("实时", {})
+        b1.metric("日前可训练样本", f"{day_status.get('trainable_rows', 0):,}")
+        b2.metric("实时可训练样本", f"{rt_status.get('trainable_rows', 0):,}")
     st.info("若需刷新数据库，请前往“数据预处理”页运行脚本。")
 
     st.markdown("---")
@@ -457,14 +464,30 @@ elif MENU == "模型训练":
     upload_file = None
     db_start: Optional[date] = None
     db_end: Optional[date] = None
+    db_boundary_type = "日前"
 
     if data_source == "上传文件":
         upload_file = st.file_uploader("上传训练数据 Excel/CSV", type=["xlsx", "csv"])
     else:
         if dataset_status["row_count"] == 0:
             st.info("数据库为空，请先到“数据预处理”页导入数据。")
-        min_date = _parse_date(dataset_status.get("date_min"))
-        max_date = _parse_date(dataset_status.get("date_max"))
+        db_model_type = st.radio(
+            "价格模型类别",
+            ["日前价格模型", "实时价格模型"],
+            horizontal=True,
+        )
+        db_boundary_type = "实时" if db_model_type == "实时价格模型" else "日前"
+        selected_status = boundary_status.get(db_boundary_type, {})
+        selected_trainable_rows = selected_status.get("trainable_rows", 0)
+        min_date = _parse_date(selected_status.get("trainable_date_min") or dataset_status.get("date_min"))
+        max_date = _parse_date(selected_status.get("trainable_date_max") or dataset_status.get("date_max"))
+        st.caption(
+            f"{db_boundary_type}数据：原始 {selected_status.get('raw_rows', 0):,} 行，"
+            f"可训练 {selected_trainable_rows:,} 行，"
+            f"价格列：{selected_status.get('price_column', '未知')}"
+        )
+        if selected_trainable_rows == 0:
+            st.info(f"数据库中暂无可训练的{db_boundary_type}数据。")
         today = date.today()
         default_end = max_date or today
         default_start = default_end - timedelta(days=30)
@@ -484,7 +507,7 @@ elif MENU == "模型训练":
             max_value=max_date or default_end,
         )
         st.caption(
-            f"可用数据区间：{dataset_status.get('date_min') or '未知'} 至 {dataset_status.get('date_max') or '未知'}"
+            f"可用数据区间：{(min_date.isoformat() if min_date else '未知')} 至 {(max_date.isoformat() if max_date else '未知')}"
         )
 
     model_name = st.text_input("模型名称", value="model_v1").strip()
@@ -512,12 +535,12 @@ elif MENU == "模型训练":
             elif db_start > db_end:
                 st.warning("起始日期需早于结束日期")
             else:
-                df = fetch_dataset(db_start, db_end)
+                df = fetch_dataset(db_start, db_end, boundary_type=db_boundary_type)
                 if df.empty:
-                    st.warning("所选日期范围没有数据")
+                    st.warning(f"所选日期范围没有可训练的{db_boundary_type}数据")
                 else:
                     df_source = df
-                    source_label = f"sqlite:{db_start}->{db_end}"
+                    source_label = f"sqlite:{db_boundary_type}:{db_start}->{db_end}"
 
         if df_source is None:
             st.stop()

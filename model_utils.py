@@ -30,7 +30,12 @@ SH_TZ = ZoneInfo("Asia/Shanghai")
 DB_COL_DATE = "日期"
 DB_COL_TIME = "时点"
 DB_COL_PRICE = "日前出清价格(元/MWh)"
+DB_COL_REAL_TIME_PRICE = "实时出清价格(元/MWh)"
 DB_COL_LOAD_RATE = "负荷率(%)"
+BOUNDARY_PRICE_COLUMNS = {
+    "日前": DB_COL_PRICE,
+    "实时": DB_COL_REAL_TIME_PRICE,
+}
 RAW_DB_COLUMNS = [
     DB_COL_DATE,
     DB_COL_TIME,
@@ -45,7 +50,7 @@ RAW_DB_COLUMNS = [
     "联络线计划(MW)",
     "在线机组容量(MW)",
     DB_COL_PRICE,
-    "实时出清价格(元/MWh)",
+    DB_COL_REAL_TIME_PRICE,
     DB_COL_LOAD_RATE,
 ]
 
@@ -423,6 +428,43 @@ def _get_date_span(conn: sqlite3.Connection) -> Tuple[Optional[str], Optional[st
     return row[0], row[1]
 
 
+def _get_boundary_dataset_status(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
+    status: Dict[str, Dict[str, Any]] = {}
+    for boundary_type, price_col in BOUNDARY_PRICE_COLUMNS.items():
+        raw_cur = conn.execute(
+            f"""
+            SELECT COUNT(*), MIN("{DB_COL_DATE}"), MAX("{DB_COL_DATE}")
+            FROM raw_marginal_data
+            WHERE "边界数据类型" = ?
+            """,
+            (boundary_type,),
+        )
+        raw_count, raw_min, raw_max = raw_cur.fetchone()
+        train_cur = conn.execute(
+            f"""
+            SELECT COUNT(*), MIN("{DB_COL_DATE}"), MAX("{DB_COL_DATE}")
+            FROM raw_marginal_data
+            WHERE "边界数据类型" = ?
+              AND "{price_col}" IS NOT NULL
+              AND "{DB_COL_LOAD_RATE}" IS NOT NULL
+              AND "{DB_COL_LOAD_RATE}" > 0
+              AND "{DB_COL_LOAD_RATE}" <= 100
+            """,
+            (boundary_type,),
+        )
+        trainable_count, train_min, train_max = train_cur.fetchone()
+        status[boundary_type] = {
+            "raw_rows": int(raw_count or 0),
+            "raw_date_min": raw_min,
+            "raw_date_max": raw_max,
+            "trainable_rows": int(trainable_count or 0),
+            "trainable_date_min": train_min,
+            "trainable_date_max": train_max,
+            "price_column": price_col,
+        }
+    return status
+
+
 def _format_epoch(ts: Optional[float]) -> Optional[str]:
     if ts is None:
         return None
@@ -547,6 +589,7 @@ def get_dataset_status() -> Dict[str, Any]:
     with _get_conn() as conn:
         _ensure_db(conn)
         row_count = _count_rows(conn)
+        boundary_status = _get_boundary_dataset_status(conn)
         meta = _get_meta_dict(conn)
         date_min, date_max = _get_date_span(conn)
 
@@ -575,6 +618,7 @@ def get_dataset_status() -> Dict[str, Any]:
         "data_dir": data_dir,
         "data_source": data_source,
         "raw_row_count": raw_row_count,
+        "boundary_status": boundary_status,
     }
 
 
@@ -685,23 +729,47 @@ def preprocess_dataset_and_sync(
     }
 
 
-def fetch_dataset(date_start: Optional[Any] = None, date_end: Optional[Any] = None) -> pd.DataFrame:
+def fetch_dataset(
+    date_start: Optional[Any] = None,
+    date_end: Optional[Any] = None,
+    *,
+    boundary_type: Optional[str] = None,
+) -> pd.DataFrame:
     start = _normalize_date(date_start)
     end = _normalize_date(date_end)
     with _get_conn() as conn:
         _ensure_db(conn)
-        query = (
-            f'SELECT "{DB_COL_DATE}" AS date, "{DB_COL_TIME}" AS time_slot, '
-            f'"{DB_COL_PRICE}" AS price, "{DB_COL_LOAD_RATE}" AS load_rate '
-            f"FROM marginal_data WHERE 1=1"
-        )
         params: List[Any] = []
-        if start:
-            query += f' AND "{DB_COL_DATE}" >= ?'
-            params.append(start)
-        if end:
-            query += f' AND "{DB_COL_DATE}" <= ?'
-            params.append(end)
+        if boundary_type is None:
+            query = (
+                f'SELECT "{DB_COL_DATE}" AS date, "{DB_COL_TIME}" AS time_slot, '
+                f'"{DB_COL_PRICE}" AS price, "{DB_COL_LOAD_RATE}" AS load_rate '
+                f"FROM marginal_data WHERE 1=1"
+            )
+            if start:
+                query += f' AND "{DB_COL_DATE}" >= ?'
+                params.append(start)
+            if end:
+                query += f' AND "{DB_COL_DATE}" <= ?'
+                params.append(end)
+        else:
+            if boundary_type not in BOUNDARY_PRICE_COLUMNS:
+                raise ValueError(f"不支持的数据类型: {boundary_type}")
+            price_col = BOUNDARY_PRICE_COLUMNS[boundary_type]
+            query = (
+                f'SELECT "{DB_COL_DATE}" AS date, "{DB_COL_TIME}" AS time_slot, '
+                f'"{price_col}" AS price, "{DB_COL_LOAD_RATE}" AS load_rate '
+                f'FROM raw_marginal_data WHERE "边界数据类型" = ?'
+                f' AND "{price_col}" IS NOT NULL'
+                f' AND "{DB_COL_LOAD_RATE}" IS NOT NULL'
+            )
+            params.append(boundary_type)
+            if start:
+                query += f' AND "{DB_COL_DATE}" >= ?'
+                params.append(start)
+            if end:
+                query += f' AND "{DB_COL_DATE}" <= ?'
+                params.append(end)
         query += " ORDER BY date, time_slot"
         df = pd.read_sql_query(query, conn, params=params)
     return df
