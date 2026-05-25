@@ -34,6 +34,33 @@ def _safe_read_excel(file_path: Path, description: str, *, verbose: bool = False
         return pd.DataFrame()
 
 
+def _normalize_report_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize old exports with a metadata row and new exports with direct headers."""
+    if df.empty:
+        return df
+    normalized_cols = {str(col).strip() for col in df.columns}
+    if "日期" in normalized_cols and ("时点" in normalized_cols or "时段" in normalized_cols):
+        result = df.copy()
+        result.columns = [str(col).strip() for col in result.columns]
+        return result
+
+    max_scan = min(len(df), 5)
+    for idx in range(max_scan):
+        row_values = ["" if pd.isna(val) else str(val).strip() for val in df.iloc[idx].tolist()]
+        row_set = set(row_values)
+        if "日期" in row_set and ("时点" in row_set or "时段" in row_set):
+            result = df.iloc[idx + 1:].reset_index(drop=True).copy()
+            result.columns = [
+                value if value else f"col_{col_idx}"
+                for col_idx, value in enumerate(row_values)
+            ]
+            return result
+
+    result = df.copy()
+    result.columns = [str(col).strip() for col in result.columns]
+    return result
+
+
 def extract_online_capacity(text):
     """从出清概况中提取在线机组容量"""
     if pd.isna(text):
@@ -109,8 +136,7 @@ def preprocess_data(data_dir: Union[str, Path] = "margin_data", *, verbose: bool
     df_load_raw = _safe_read_excel(data_dir / "日前统调系统负荷预测_REPORT0.xlsx", "日前统调系统负荷预测", verbose=verbose)
     df_load = pd.DataFrame()
     if not df_load_raw.empty:
-        # 从第2行开始读取数据（跳过表头行）
-        df_load = df_load_raw.iloc[1:].reset_index(drop=True)
+        df_load = _normalize_report_table(df_load_raw)
         df_load['日期'] = pd.to_datetime(df_load.iloc[:, 1]).dt.date
         df_load['时点'] = df_load.iloc[:, 2].astype(str)
         df_load['省调负荷(MW)'] = pd.to_numeric(df_load.iloc[:, 3], errors='coerce')
@@ -120,7 +146,7 @@ def preprocess_data(data_dir: Union[str, Path] = "margin_data", *, verbose: bool
     df_renewable_raw = _safe_read_excel(data_dir / "日前新能源负荷预测_REPORT0.xlsx", "日前新能源负荷预测", verbose=verbose)
     df_renewable = pd.DataFrame()
     if not df_renewable_raw.empty:
-        df_renewable = df_renewable_raw.iloc[1:].reset_index(drop=True)
+        df_renewable = _normalize_report_table(df_renewable_raw)
         df_renewable['日期'] = pd.to_datetime(df_renewable.iloc[:, 1]).dt.date
         df_renewable['时点'] = df_renewable.iloc[:, 2].astype(str)
         df_renewable['风电(MW)'] = pd.to_numeric(df_renewable.iloc[:, 4], errors='coerce')
@@ -132,7 +158,7 @@ def preprocess_data(data_dir: Union[str, Path] = "margin_data", *, verbose: bool
     df_disclosure_raw = _safe_read_excel(data_dir / "披露信息96点数据_REPORT0.xlsx", "披露信息96点数据", verbose=verbose)
     df_disclosure = pd.DataFrame()
     if not df_disclosure_raw.empty:
-        df_disclosure = df_disclosure_raw.iloc[1:].reset_index(drop=True)
+        df_disclosure = _normalize_report_table(df_disclosure_raw)
         df_disclosure['日期'] = pd.to_datetime(df_disclosure.iloc[:, 1]).dt.date
         df_disclosure['时点'] = df_disclosure.iloc[:, 2].astype(str)
         df_disclosure['非市场化出力(MW)'] = pd.to_numeric(df_disclosure.iloc[:, 3], errors='coerce')
@@ -142,28 +168,44 @@ def preprocess_data(data_dir: Union[str, Path] = "margin_data", *, verbose: bool
     df_tie_line_raw = _safe_read_excel(data_dir / "日前联络线计划_REPORT0.xlsx", "日前联络线计划", verbose=verbose)
     df_tie_line = pd.DataFrame()
     if not df_tie_line_raw.empty:
-        df_tie_line = df_tie_line_raw.iloc[1:].reset_index(drop=True)
-        df_tie_line = df_tie_line[df_tie_line.iloc[:, 1] == '总加']  # 只取总加行
-        df_tie_line['日期'] = pd.to_datetime(df_tie_line.iloc[:, 2]).dt.date
-        df_tie_line['时点'] = df_tie_line.iloc[:, 3].astype(str)
-        df_tie_line['联络线计划(MW)'] = pd.to_numeric(df_tie_line.iloc[:, 4], errors='coerce')
+        df_tie_line = _normalize_report_table(df_tie_line_raw)
+        channel_col = _find_column(df_tie_line.columns, [["通道"]])
+        date_col = _find_column(df_tie_line.columns, [["日期"]])
+        time_col = _find_column(df_tie_line.columns, [["时点"], ["时段"]])
+        value_col = _find_column(df_tie_line.columns, [["电力值"], ["电力"]])
+        if channel_col and date_col and time_col and value_col:
+            df_tie_line = df_tie_line[df_tie_line[channel_col] == '总加'].copy()
+            df_tie_line['日期'] = pd.to_datetime(df_tie_line[date_col]).dt.date
+            df_tie_line['时点'] = df_tie_line[time_col].astype(str)
+            df_tie_line['联络线计划(MW)'] = pd.to_numeric(df_tie_line[value_col], errors='coerce')
 
     # 5. 读取日前市场出清情况_TABLE - 提取在线机组容量 -> L列
     _log("处理日前市场出清情况...", verbose=verbose)
     df_clearing_raw = _safe_read_excel(data_dir / "日前市场出清情况_TABLE.xlsx", "日前市场出清情况", verbose=verbose)
     online_capacity = None
     if not df_clearing_raw.empty:
-        df_clearing = df_clearing_raw.iloc[1:].reset_index(drop=True)
-        # 提取在线机组容量（只有一个值，应用到所有行）
-        online_capacity = extract_online_capacity(df_clearing.iloc[0, 2])
-        _log(f"  提取到在线机组容量: {online_capacity} MW", verbose=verbose)
+        overview_col = _find_column(df_clearing_raw.columns, [["出清概况"]])
+        if overview_col is not None:
+            overview_values = df_clearing_raw[overview_col].dropna()
+        else:
+            df_clearing = df_clearing_raw.iloc[1:].reset_index(drop=True)
+            overview_values = df_clearing.iloc[:, 2].dropna() if not df_clearing.empty and df_clearing.shape[1] > 2 else pd.Series(dtype=object)
+
+        for overview in overview_values:
+            online_capacity = extract_online_capacity(overview)
+            if online_capacity is not None:
+                break
+        if online_capacity is not None:
+            _log(f"  提取到在线机组容量: {online_capacity} MW", verbose=verbose)
+        else:
+            _log("  未找到日前在线机组容量数据，已跳过。", verbose=verbose)
 
     # 7. 读取日前水电计划发电总出力预测_REPORT0 - D列 -> 水电出力(MW) J列
     _log("处理日前水电计划...", verbose=verbose)
     df_hydro_raw = _safe_read_excel(data_dir / "日前水电计划发电总出力预测_REPORT0.xlsx", "日前水电计划", verbose=verbose)
     df_hydro = pd.DataFrame()
     if not df_hydro_raw.empty:
-        df_hydro = df_hydro_raw.iloc[1:].reset_index(drop=True)
+        df_hydro = _normalize_report_table(df_hydro_raw)
         df_hydro['日期'] = pd.to_datetime(df_hydro.iloc[:, 1]).dt.date
         df_hydro['时点'] = df_hydro.iloc[:, 2].astype(str)
         df_hydro['水电出力(MW)'] = pd.to_numeric(df_hydro.iloc[:, 3], errors='coerce')
@@ -173,7 +215,7 @@ def preprocess_data(data_dir: Union[str, Path] = "margin_data", *, verbose: bool
     df_actual_raw = _safe_read_excel(data_dir / "96点电网运行实际值_REPORT0.xlsx", "96点电网运行实际值", verbose=verbose)
     df_actual = pd.DataFrame()
     if not df_actual_raw.empty:
-        df_actual = df_actual_raw.iloc[1:].reset_index(drop=True)
+        df_actual = _normalize_report_table(df_actual_raw)
         df_actual['日期'] = pd.to_datetime(df_actual.iloc[:, 1]).dt.date
         df_actual['时点'] = df_actual.iloc[:, 2].astype(str)
         df_actual['省调负荷(MW)'] = pd.to_numeric(df_actual.iloc[:, 3], errors='coerce')
@@ -188,11 +230,16 @@ def preprocess_data(data_dir: Union[str, Path] = "margin_data", *, verbose: bool
     df_tie_line_rt_raw = _safe_read_excel(data_dir / "实时联络线计划_REPORT0.xlsx", "实时联络线计划", verbose=verbose)
     df_tie_line_rt = pd.DataFrame()
     if not df_tie_line_rt_raw.empty:
-        df_tie_line_rt = df_tie_line_rt_raw.iloc[1:].reset_index(drop=True)
-        df_tie_line_rt = df_tie_line_rt[df_tie_line_rt.iloc[:, 1] == '总加']  # 只取总加行
-        df_tie_line_rt['日期'] = pd.to_datetime(df_tie_line_rt.iloc[:, 2]).dt.date
-        df_tie_line_rt['时点'] = df_tie_line_rt.iloc[:, 3].astype(str)
-        df_tie_line_rt['联络线计划(MW)'] = pd.to_numeric(df_tie_line_rt.iloc[:, 4], errors='coerce')
+        df_tie_line_rt = _normalize_report_table(df_tie_line_rt_raw)
+        channel_col = _find_column(df_tie_line_rt.columns, [["通道"]])
+        date_col = _find_column(df_tie_line_rt.columns, [["日期"]])
+        time_col = _find_column(df_tie_line_rt.columns, [["时点"], ["时段"]])
+        value_col = _find_column(df_tie_line_rt.columns, [["电力值"], ["电力"]])
+        if channel_col and date_col and time_col and value_col:
+            df_tie_line_rt = df_tie_line_rt[df_tie_line_rt[channel_col] == '总加'].copy()
+            df_tie_line_rt['日期'] = pd.to_datetime(df_tie_line_rt[date_col]).dt.date
+            df_tie_line_rt['时点'] = df_tie_line_rt[time_col].astype(str)
+            df_tie_line_rt['联络线计划(MW)'] = pd.to_numeric(df_tie_line_rt[value_col], errors='coerce')
 
     # 10. 读取现货出清电价_REPORT0 - 实时和日前出清价格
     _log("处理现货出清电价...", verbose=verbose)
@@ -200,7 +247,7 @@ def preprocess_data(data_dir: Union[str, Path] = "margin_data", *, verbose: bool
     df_price = pd.DataFrame()
     if not df_price_raw.empty:
         # 过滤掉均价汇总行（序号不是数字的行）
-        df_price = df_price_raw[pd.to_numeric(df_price_raw['序号'], errors='coerce').notna()]
+        df_price = df_price_raw[pd.to_numeric(df_price_raw['序号'], errors='coerce').notna()].copy()
         df_price['日期'] = pd.to_datetime(df_price['日期']).dt.date
         df_price['时点'] = df_price['时点'].astype(str)
         df_price['实时出清价格(元/MWh)'] = pd.to_numeric(df_price['实时出清价格(元/MWh)'], errors='coerce')

@@ -604,8 +604,6 @@ def preprocess_dataset_and_sync(
 
     cleaned = clean_marginal_data(raw_df.copy())
     cleaned = cleaned.sort_values(["date", "time_slot"]).reset_index(drop=True)
-    if cleaned.empty:
-        raise ValueError("清洗后的数据为空，无法导入")
 
     fingerprint = _calc_dataframe_hash(cleaned)
     if source_label:
@@ -641,7 +639,6 @@ def preprocess_dataset_and_sync(
 
         # 增量更新：只删除新数据涉及的日期范围，避免清空整个数据库
         if not cleaned.empty:
-            # 获取新数据的日期范围
             new_dates = cleaned["date"].unique()
             date_placeholders = ",".join("?" * len(new_dates))
 
