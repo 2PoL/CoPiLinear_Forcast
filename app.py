@@ -24,6 +24,7 @@ from model_utils import (
     format_time_shanghai,
 )
 
+from daily_rolling_forecast import predict_daily_rolling_price_interval
 from scripts.pre_process import preprocess_data, preprocess_template_file
 
 
@@ -91,7 +92,7 @@ def _persist_uploaded_files(files, dest_dir: Path) -> None:
 st.set_page_config(page_title="CoPiLinear", layout="wide")
 st.title("CoPiLinear 价格预测工具")
 
-MENU = st.sidebar.radio("导航", ["数据预处理", "模型管理", "模型训练", "日前价格预测"])
+MENU = st.sidebar.radio("导航", ["数据预处理", "模型管理", "模型训练", "日前价格预测", "日滚动价格预测"])
 
 
 # ----------------------------------------
@@ -705,6 +706,64 @@ elif MENU == "日前价格预测":
             .properties(height=300)
         )
         _altair_chart(chart, width="stretch")
+
+
+elif MENU == "日滚动价格预测":
+    st.subheader("日滚动价格预测")
+    st.caption("上传日滚动模板，读取「24点区间」sheet 中的负荷率区间，并按已训练模型输出价格区间 CSV。")
+
+    models = list_models()
+    if not models:
+        st.warning("暂无可用模型，请先在“模型训练”页训练并保存模型。")
+        st.stop()
+
+    selected_model = st.selectbox("选择模型", models)
+    template_file = st.file_uploader("上传日滚动模板 Excel", type=["xlsx"], key="daily_rolling_template")
+
+    if st.button("生成价格区间预测", type="primary", disabled=template_file is None):
+        if template_file is None:
+            st.warning("请先上传模板文件")
+            st.stop()
+
+        model = load_model(selected_model)
+        if model is None:
+            st.error(f"模型 '{selected_model}' 加载失败")
+            st.stop()
+
+        try:
+            with st.spinner("正在读取 24点区间 并预测价格区间..."):
+                template_file.seek(0)
+                result_df = predict_daily_rolling_price_interval(
+                    template_file,
+                    model,
+                    model_name=selected_model,
+                )
+            st.session_state["daily_rolling_result"] = result_df
+            st.session_state["daily_rolling_model"] = selected_model
+        except Exception as exc:
+            st.error(f"预测失败：{exc}")
+            st.stop()
+
+    if "daily_rolling_result" in st.session_state:
+        result_df = st.session_state["daily_rolling_result"]
+        st.success(f"预测完成，共 {len(result_df):,} 行，覆盖 {result_df['日期'].nunique():,} 个日期。")
+
+        tabs = st.tabs(result_df["日期"].drop_duplicates().tolist())
+        for tab, current_date in zip(tabs, result_df["日期"].drop_duplicates().tolist()):
+            with tab:
+                day_df = result_df[result_df["日期"] == current_date].reset_index(drop=True)
+                st.dataframe(day_df, use_container_width=True)
+
+        csv_data = result_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        date_min = result_df["日期"].min()
+        date_max = result_df["日期"].max()
+        safe_model = str(st.session_state.get("daily_rolling_model", selected_model)).replace("/", "_")
+        st.download_button(
+            "下载 CSV 预测结果",
+            csv_data,
+            file_name=f"日滚动价格预测_{safe_model}_{date_min}_{date_max}.csv",
+            mime="text/csv",
+        )
 
 
 else:
